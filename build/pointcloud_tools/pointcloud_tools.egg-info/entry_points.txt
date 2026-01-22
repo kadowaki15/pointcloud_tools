@@ -1,0 +1,10 @@
+[console_scripts]
+dynamic_cluster_node = scripts.dynamic_cluster_node:main
+ego_compensator = scripts.ego_compensator:main
+intent_estimator = scripts.intent_estimator:main
+pointcloud_diff = pointcloud_tools.pointcloud_diff:main
+rgb_object_locator = scripts.rgb_object_locator:main
+safety_interface = scripts.safety_interface:main
+static_obstacle_detector = scripts.static_obstacle_detector:main
+tracker = scripts.tracker:main
+

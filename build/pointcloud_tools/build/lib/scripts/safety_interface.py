@@ -2,18 +2,18 @@
 """
 safety_interface (ROS2 Humble)
 
-前提（あなたの今の環境）:
-- /tf は publisher 0（動的TFなし）
-- /tf_static は RealSense が出している（静的TFのみ）
-- /tracked_markers は frame_id = camera_depth_optical_frame（optical座標）
+KEEP (unchanged):
+- APPROACH: distance-based STOP/SLOW + hold (uses dmin)
+- STATIC  : avoid (trigger latch to prevent flicker)
+- NORMAL  : pass-through cmd_vel (or default_speed)
 
-この版は optical座標の軸（前方=z, 左右=x）に合わせて距離判定を行い、
-「危険でSTOPしたら最低 stop_min_hold_sec は停止を維持」する。
+CHANGE (only crossing):
+- CROSSING uses rng (from /object_intents) ONLY
+  - far crossing: IGNORE (no slow)
+  - near crossing: SLOW/STOP + hold
 
-- CROSSING: rng-based near-only
-- APPROACH: tracked_markers の前方距離(z)で STOP/SLOW + hold
-- STATIC  : static_obstacles 回避（前方=z, 左右=x）
-- EMERGENCY STOP: if ANY obstacle closer than emergency_stop_dist -> STOP + hold
+Extra guard:
+- If FAR crossing was seen recently, suppress APPROACH-triggered slow/stop for a short window.
 """
 
 import rclpy
@@ -40,8 +40,8 @@ class SafetyInterface(Node):
         self.declare_parameter('static_topic', '/static_obstacles')
         self.declare_parameter('tracked_topic', '/tracked_markers')
         self.declare_parameter('intent_topic', '/object_intents')
-        self.declare_parameter('cmd_topic', '/cmd_vel')
-        self.declare_parameter('publish_topic', '/cmd_vel_safe')
+        self.declare_parameter('cmd_topic', '/cmd_vel_in')
+        self.declare_parameter('publish_topic', '/cmd_vel')
 
         # ---------------- loop ----------------
         self.declare_parameter('tick_dt', 0.2)
@@ -50,36 +50,30 @@ class SafetyInterface(Node):
         self.declare_parameter('default_speed', 0.15)
         self.declare_parameter('slow_speed', 0.05)
 
-        # ---------------- MIN STOP HOLD (NEW) ----------------
-        # 「危険と判断して停止したら最低この秒数は停止を維持」
-        self.declare_parameter('stop_min_hold_sec', 1.0)
+        # ---------------- APPROACH (UNCHANGED logic, tuned holds) ----------------
+        self.declare_parameter('stop_dist', 0.4)
+        self.declare_parameter('slow_dist', 1.0)
 
-        # ---------------- EMERGENCY STOP ----------------
-        self.declare_parameter('emergency_stop_dist', 0.30)
-        self.declare_parameter('emergency_hold_sec', 1.5)
+        # ★おすすめ（短め）
+        self.declare_parameter('stop_hold_sec', 1.2)   # was 2.0
+        self.declare_parameter('slow_hold_sec', 1.5)   # was 3.0
 
-        # Emergency gate (front corridor)
-        # optical前提: 前方=z、左右=x として扱う
-        self.declare_parameter('emg_gate_x_max', 0.80)   # = z_max
-        self.declare_parameter('emg_gate_y_half', 0.45)  # = x_half
-
-        # ---------------- APPROACH (dynamic) ----------------
-        self.declare_parameter('stop_dist', 0.45)
-        self.declare_parameter('slow_dist', 1.00)
-
-        self.declare_parameter('stop_hold_sec', 1.5)
-        self.declare_parameter('slow_hold_sec', 1.2)
-
-        # approach gate（optical前提: z_min/z_max として解釈）
-        self.declare_parameter('dyn_gate_x_min', 0.10)  # = z_min
-        self.declare_parameter('dyn_gate_x_max', 2.00)  # = z_max
-        self.declare_parameter('dyn_gate_y_half', 0.45) # = x_half
+        # approach uses dmin but only in front corridor
+        self.declare_parameter('dyn_gate_x_min', 0.10)
+        self.declare_parameter('dyn_gate_x_max', 2.00)
+        self.declare_parameter('dyn_gate_y_half', 0.35)
 
         # ---------------- CROSSING ----------------
         self.declare_parameter('cross_stop_dist', 0.35)
         self.declare_parameter('cross_slow_dist', 0.80)
-        self.declare_parameter('cross_hold_sec', 0.6)
+
+        # ★おすすめ（短め）
+        self.declare_parameter('cross_hold_sec', 0.6)   # was 1.2
+
+        # crossing label flicker absorber（そのまま）
         self.declare_parameter('cross_cache_sec', 0.8)
+
+        # Guard: far-crossing seen -> suppress approach for short time（そのまま）
         self.declare_parameter('far_cross_suppress_sec', 0.8)
 
         # ---------------- output smoothing ----------------
@@ -87,22 +81,20 @@ class SafetyInterface(Node):
         self.declare_parameter('max_accel', 0.15)  # m/s^2
         self.declare_parameter('max_decel', 0.30)  # m/s^2
 
-        # ---------------- STATIC (avoid + hold) ----------------
-        self.declare_parameter('front_trigger_dist', 0.70)
-        self.declare_parameter('lateral_scan_dist', 1.8)
-        self.declare_parameter('path_half_width', 0.35)
+        # ---------------- STATIC (UNCHANGED) ----------------
+        self.declare_parameter('front_trigger_dist', 0.5)
+        self.declare_parameter('lateral_scan_dist', 1.5)
+        self.declare_parameter('path_half_width', 0.3)
         self.declare_parameter('avoidance_angular', 0.6)
 
-        self.declare_parameter('static_cache_sec', 1.2)
+        self.declare_parameter('static_cache_sec', 0.6)
         self.declare_parameter('static_on_frames', 3)
-        self.declare_parameter('static_off_frames', 6)
-        self.declare_parameter('static_avoid_hold_sec', 1.0)
-
-        self.declare_parameter('front_off_dist', 0.85)
-        self.declare_parameter('path_off_half_width', 0.50)
+        self.declare_parameter('static_off_frames', 5)
+        self.declare_parameter('front_off_dist', 0.7)
+        self.declare_parameter('path_off_half_width', 0.45)
 
         # ---------------- frames ----------------
-        self.declare_parameter('base_frame', 'camera_link')
+        self.declare_parameter('base_frame', 'base_link')
 
         # load parameters
         for p in self._parameters:
@@ -117,13 +109,13 @@ class SafetyInterface(Node):
             self.tf_buffer = None
 
         # subs/pubs
-        self.sub_static  = self.create_subscription(MarkerArray, self.static_topic,  self.cb_static,  10)
+        self.sub_static = self.create_subscription(MarkerArray, self.static_topic, self.cb_static, 10)
         self.sub_tracked = self.create_subscription(MarkerArray, self.tracked_topic, self.cb_tracked, 10)
-        self.sub_intent  = self.create_subscription(String,      self.intent_topic,  self.cb_intent,  10)
-        self.sub_cmd     = self.create_subscription(Twist,       self.cmd_topic,     self.cb_cmd,     10)
+        self.sub_intent = self.create_subscription(String, self.intent_topic, self.cb_intent, 10)
+        self.sub_cmd = self.create_subscription(Twist, self.cmd_topic, self.cb_cmd, 10)
 
-        self.pub_cmd   = self.create_publisher(Twist,  self.publish_topic, 10)
-        self.pub_state = self.create_publisher(String, '/safety_state',    10)
+        self.pub_cmd = self.create_publisher(Twist, self.publish_topic, 10)
+        self.pub_state = self.create_publisher(String, '/safety_state', 10)
 
         # internal state
         self.latest_cmd = Twist()
@@ -135,11 +127,11 @@ class SafetyInterface(Node):
         self._static_latched = False
         self._static_true_cnt = 0
         self._static_false_cnt = 0
-        self._static_avoid_until = 0.0
 
         # intent cache for crossing
         self._last_cross_time = 0.0
         self._last_cross_rng = float('nan')
+        self._last_cross_kind = ''  # for debug
         self._far_cross_until = 0.0
 
         # dynamic hold
@@ -150,7 +142,7 @@ class SafetyInterface(Node):
         # slew output
         self._v_out = 0.0
 
-        self.get_logger().info("safety_interface started (optical-aware, STOP min-hold enabled)")
+        self.get_logger().info("safety_interface started (recommended holds + no hold-extension loop)")
 
     # ---------------- callbacks ----------------
     def cb_cmd(self, msg: Twist):
@@ -175,6 +167,8 @@ class SafetyInterface(Node):
             return
 
         self._last_cross_time = time.time()
+        self._last_cross_kind = state
+
         if len(parts) >= 7:
             try:
                 self._last_cross_rng = float(parts[6])
@@ -189,10 +183,6 @@ class SafetyInterface(Node):
 
     # ---------------- transform ----------------
     def _pose_to_base(self, marker):
-        """
-        TFが取れるなら base_frame へ変換した (x,y,z) を返す。
-        取れないなら marker.pose.position の (x,y,z) をそのまま返す（= optical座標のまま）。
-        """
         if TF2_AVAILABLE and marker.header.frame_id:
             try:
                 ps = PoseStamped()
@@ -202,83 +192,33 @@ class SafetyInterface(Node):
                     self.base_frame, marker.header.frame_id, rclpy.time.Time())
                 out = tf2_geometry_msgs.do_transform_pose(ps, tr)
                 p = out.pose.position
-                return (float(p.x), float(p.y), float(p.z))
+                return (p.x, p.y, p.z)
             except Exception:
                 pass
-
-        return (float(marker.pose.position.x),
-                float(marker.pose.position.y),
-                float(marker.pose.position.z))
+        # fallback mapping (your convention)
+        return (marker.pose.position.z, -marker.pose.position.x, -marker.pose.position.y)
 
     # ---------------- helpers ----------------
     def _closest_dynamic_front(self):
         now = time.time()
         dmin = None
 
-        z_min = float(self.dyn_gate_x_min)
-        z_max = float(self.dyn_gate_x_max)
-        x_half = float(self.dyn_gate_y_half)
+        x_min = float(self.dyn_gate_x_min)
+        x_max = float(self.dyn_gate_x_max)
+        y_half = float(self.dyn_gate_y_half)
 
         for t, pts in self.recent_tracked:
             if now - t > 1.2:
                 continue
-            for x, y, z in pts:
-                if z <= z_min:
+            for x, y, _ in pts:
+                if x <= x_min:
                     continue
-                if z >= z_max:
+                if x >= x_max:
                     continue
-                if abs(x) >= x_half:
+                if abs(y) >= y_half:
                     continue
-                d = z
+                d = math.hypot(x, y)
                 dmin = d if dmin is None else min(dmin, d)
-
-        return dmin
-
-    def _static_effective_objs(self):
-        if (time.time() - self._last_static_time) <= float(self.static_cache_sec):
-            return self.static_objs
-        return []
-
-    def _closest_static_front(self):
-        objs = self._static_effective_objs()
-        if not objs:
-            return None
-
-        dmin = None
-        z_max = float(self.emg_gate_x_max)
-        x_half = float(self.emg_gate_y_half)
-
-        for x, y, z in objs:
-            if z <= 0.0:
-                continue
-            if z > z_max:
-                continue
-            if abs(x) > x_half:
-                continue
-            d = z
-            dmin = d if dmin is None else min(dmin, d)
-
-        return dmin
-
-    def _closest_dynamic_front_emg(self):
-        now = time.time()
-        dmin = None
-        z_max = float(self.emg_gate_x_max)
-        x_half = float(self.emg_gate_y_half)
-
-        for t, pts in self.recent_tracked:
-            if now - t > 1.0:
-                continue
-            for x, y, z in pts:
-                if z <= 0.0:
-                    continue
-                if z > z_max:
-                    continue
-                if abs(x) > x_half:
-                    continue
-                d = z
-                dmin = d if dmin is None else min(dmin, d)
-
         return dmin
 
     def _slew_v(self, v_target: float):
@@ -307,53 +247,33 @@ class SafetyInterface(Node):
     def _stop(self):
         self._publish(0.0, 0.0)
 
-    def _hold_sec_for_mode(self, mode: str, hold_sec: float) -> float:
-        # STOP は最低 stop_min_hold_sec を保証
-        if mode == "STOP":
-            return max(float(hold_sec), float(self.stop_min_hold_sec))
-        return float(hold_sec)
-
+    # ★ここが重要：同じ理由で毎tick延長しない
     def _set_hold(self, mode: str, reason: str, hold_sec: float):
-        """
-        holdの仕様：
-        - STOP は最低 stop_min_hold_sec を必ず満たす
-        - STOP は「危険が継続しているなら延長してよい」（安全寄り）
-        - SLOW は同reasonで毎tick延長しない（振動防止）
-        """
         now = time.time()
-        hold_sec = self._hold_sec_for_mode(mode, hold_sec)
-        new_until = now + hold_sec
 
-        if mode == "STOP":
-            # STOPは安全のため延長を許可（ただし短縮はしない）
-            if self._dyn_mode == "STOP":
-                if new_until > float(self._dyn_lock_until):
-                    self._dyn_lock_until = new_until
-                    self._dyn_reason = reason
-                else:
-                    # reasonだけ更新したいならここで更新しても良いが、
-                    # ログがうるさくなるので基本は更新しない
-                    pass
-                return
-
-        # それ以外は、同じmode+reasonでlock中なら延長しない
+        # 同じ mode & reason で、すでに lock 中なら延長しない
         if (self._dyn_mode == mode) and (self._dyn_reason == reason) and (now < float(self._dyn_lock_until)):
             return
 
         self._dyn_mode = mode
         self._dyn_reason = reason
-        self._dyn_lock_until = new_until
+        self._dyn_lock_until = now + float(hold_sec)
 
-    # ---------------- STATIC latch ----------------
+    # ---------------- STATIC latch (unchanged) ----------------
+    def _static_effective_objs(self):
+        if (time.time() - self._last_static_time) <= float(self.static_cache_sec):
+            return self.static_objs
+        return []
+
     def _static_raw_on(self, objs):
-        for x, y, z in objs:
-            if 0.0 < z < float(self.front_trigger_dist) and abs(x) < float(self.path_half_width):
+        for x, y, _ in objs:
+            if 0.0 < x < float(self.front_trigger_dist) and abs(y) < float(self.path_half_width):
                 return True
         return False
 
     def _static_raw_off(self, objs):
-        for x, y, z in objs:
-            if 0.0 < z < float(self.front_off_dist) and abs(x) < float(self.path_off_half_width):
+        for x, y, _ in objs:
+            if 0.0 < x < float(self.front_off_dist) and abs(y) < float(self.path_off_half_width):
                 return False
         return True
 
@@ -378,12 +298,12 @@ class SafetyInterface(Node):
     def _free_space_score(self, side, objs):
         score = 0.0
         scan = float(self.lateral_scan_dist)
-        for x, y, z in objs:
-            if 0 < z < scan:
-                if side == 'RIGHT' and x > 0:
-                    score += 1.0 / max(z, 0.1)
-                if side == 'LEFT' and x < 0:
-                    score += 1.0 / max(z, 0.1)
+        for x, y, _ in objs:
+            if 0 < x < scan:
+                if side == 'LEFT' and y > 0:
+                    score += 1.0 / max(x, 0.1)
+                if side == 'RIGHT' and y < 0:
+                    score += 1.0 / max(x, 0.1)
         return score
 
     # ---------------- main loop ----------------
@@ -391,22 +311,6 @@ class SafetyInterface(Node):
         now = time.time()
         lock_active = now < float(self._dyn_lock_until)
         lock_remain = max(0.0, float(self._dyn_lock_until) - now)
-
-        # ===== (0) EMERGENCY STOP (highest priority) =====
-        d_dyn_emg = self._closest_dynamic_front_emg()
-        d_sta_emg = self._closest_static_front()
-        d_any = None
-        if d_dyn_emg is not None:
-            d_any = d_dyn_emg
-        if d_sta_emg is not None:
-            d_any = d_sta_emg if d_any is None else min(d_any, d_sta_emg)
-
-        if d_any is not None and d_any < float(self.emergency_stop_dist):
-            self._set_hold("STOP", f"EMERGENCY_STOP d={d_any:.2f}", float(self.emergency_hold_sec))
-            lock_remain = max(0.0, float(self._dyn_lock_until) - now)
-            self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
-            self._stop()
-            return
 
         # ===== (A) CROSSING near-only =====
         cross_recent = (now - float(self._last_cross_time)) < float(self.cross_cache_sec)
@@ -418,6 +322,7 @@ class SafetyInterface(Node):
             elif rng < float(self.cross_slow_dist):
                 self._set_hold("SLOW", f"CROSS_SLOW rng={rng:.2f}", float(self.cross_hold_sec))
             else:
+                # FAR crossing => ignore
                 if not lock_active:
                     self._dyn_mode = "NORMAL"
                     self._dyn_reason = f"CROSS_FAR_IGNORE rng={rng:.2f}"
@@ -434,20 +339,16 @@ class SafetyInterface(Node):
                 self.pub_state.publish(String(data=f"DYN_SLOW {self._dyn_reason} lock={lock_remain:.2f}s"))
                 self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                 return
+            # NORMAL fall-through
 
-        # ===== (B) APPROACH (dynamic), suppressed during FAR-cross window =====
+        # ===== (B) APPROACH (unchanged), suppressed during FAR-cross window =====
         if now < float(self._far_cross_until):
-            v_in = float(self.latest_cmd.linear.x)
-            v_cmd = v_in if abs(v_in) > 1e-6 else float(self.default_speed)
             self.pub_state.publish(String(data="FAR_CROSS_SUPPRESS_APPROACH"))
-            self._publish(v_cmd, float(self.latest_cmd.angular.z))
-            return
         else:
             dmin = self._closest_dynamic_front()
 
-            # lockが残ってる間はSTOP/SLOWを優先
+            # if locked, keep it (only allow SLOW->STOP upgrade)
             if lock_active:
-                # lock中にさらに危険になったらSTOPへ格上げ
                 if self._dyn_mode == "SLOW" and dmin is not None and dmin < float(self.stop_dist):
                     self._set_hold("STOP", f"APPROACH_STOP d={dmin:.2f}", float(self.stop_hold_sec))
 
@@ -461,7 +362,7 @@ class SafetyInterface(Node):
                     self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                     return
 
-            # 新規判定
+            # not locked: decide fresh
             if dmin is not None and dmin < float(self.stop_dist):
                 self._set_hold("STOP", f"APPROACH_STOP d={dmin:.2f}", float(self.stop_hold_sec))
                 lock_remain = max(0.0, float(self._dyn_lock_until) - now)
@@ -476,17 +377,12 @@ class SafetyInterface(Node):
                 self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                 return
 
-        # ===== (C) STATIC avoid + extra hold =====
+        # ===== (C) STATIC (unchanged) =====
         static_on, objs = self._update_static_latch()
         if static_on:
-            self._static_avoid_until = max(self._static_avoid_until, now + float(self.static_avoid_hold_sec))
-
-        if static_on or (now < float(self._static_avoid_until)):
-            objs_eff = objs if objs else self._static_effective_objs()
-            left = self._free_space_score('LEFT', objs_eff)
-            right = self._free_space_score('RIGHT', objs_eff)
-            self.pub_state.publish(String(data=f"STATIC_AVOID L:{left:.2f} R:{right:.2f} hold={(max(0.0,self._static_avoid_until-now)):.2f}s"))
-
+            left = self._free_space_score('LEFT', objs)
+            right = self._free_space_score('RIGHT', objs)
+            self.pub_state.publish(String(data=f"STATIC_AVOID L:{left:.2f} R:{right:.2f}"))
             if left < right:
                 self._publish(0.0, -float(self.avoidance_angular))
             else:

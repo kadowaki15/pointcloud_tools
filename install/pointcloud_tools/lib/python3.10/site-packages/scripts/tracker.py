@@ -5,6 +5,7 @@ from visualization_msgs.msg import MarkerArray, Marker
 from std_msgs.msg import String
 import numpy as np
 from collections import deque
+import time
 
 # =================================================
 # Simple Kalman Filter (x, y, vx, vy)
@@ -77,10 +78,6 @@ class TrackerNode(Node):
 
         self.declare_parameter('rgb_match_dist', 0.6)
 
-        # Z smoothing (NEW): z がノイズるので少し平滑化
-        self.declare_parameter('z_alpha', 0.35)   # 0〜1、大きいほど観測を重視
-        self.declare_parameter('z_default', 0.50) # zが取れない時のフォールバック
-
         # -------------------------
         # Load parameters
         # -------------------------
@@ -89,18 +86,15 @@ class TrackerNode(Node):
         self.output_topic = self.get_parameter('output_topic').value
         self.debug_topic = self.get_parameter('debug_topic').value
 
-        self.match_dist = float(self.get_parameter('match_dist').value)
-        self.ttl = int(self.get_parameter('ttl').value)
-        self.history_len = int(self.get_parameter('history_len').value)
+        self.match_dist = self.get_parameter('match_dist').value
+        self.ttl = self.get_parameter('ttl').value
+        self.history_len = self.get_parameter('history_len').value
 
-        self.weak_th = float(self.get_parameter('weak_approach_thresh').value)
-        self.strong_th = float(self.get_parameter('strong_approach_thresh').value)
-        self.cross_th = float(self.get_parameter('crossing_thresh').value)
+        self.weak_th = self.get_parameter('weak_approach_thresh').value
+        self.strong_th = self.get_parameter('strong_approach_thresh').value
+        self.cross_th = self.get_parameter('crossing_thresh').value
 
-        self.rgb_match_dist = float(self.get_parameter('rgb_match_dist').value)
-
-        self.z_alpha = float(self.get_parameter('z_alpha').value)
-        self.z_default = float(self.get_parameter('z_default').value)
+        self.rgb_match_dist = self.get_parameter('rgb_match_dist').value
 
         # -------------------------
         # ROS I/O
@@ -125,7 +119,7 @@ class TrackerNode(Node):
         self.frame = 0
         self.latest_rgb = []
 
-        self.get_logger().info("Tracker initialized (approach 2-stage + crossing + RGB, z passthrough)")
+        self.get_logger().info("Tracker initialized (approach 2-stage + crossing + RGB)")
 
     # -------------------------------------------------
     # RGB callback
@@ -142,14 +136,10 @@ class TrackerNode(Node):
     # -------------------------------------------------
     def cb(self, msg: MarkerArray):
         self.frame += 1
-
-        # detections: (x, y, z)
-        detections = []
-        for m in msg.markers:
-            detections.append(np.array(
-                [m.pose.position.x, m.pose.position.y, m.pose.position.z],
-                dtype=np.float32
-            ))
+        detections = [
+            np.array([m.pose.position.x, m.pose.position.y], dtype=np.float32)
+            for m in msg.markers
+        ]
 
         out = MarkerArray()
         debug_lines = []
@@ -163,40 +153,24 @@ class TrackerNode(Node):
 
         # ---------- Associate ----------
         for det in detections:
-            det_xy = det[:2]
-            det_z = float(det[2])
-
             best_id, best_d = None, float('inf')
             for tid, tr in self.tracks.items():
-                d = np.linalg.norm(det_xy - tr['kf'].pos())
+                d = np.linalg.norm(det - tr['kf'].pos())
                 if d < best_d and d < self.match_dist:
                     best_d, best_id = d, tid
 
             if best_id is not None:
-                tr = self.tracks[best_id]
-                tr['kf'].update(det_xy[0], det_xy[1])
-                tr['last'] = self.frame
-
-                # z update (EMA)
-                if np.isfinite(det_z) and det_z > 0.0:
-                    tr['z'] = (1.0 - self.z_alpha) * tr['z'] + self.z_alpha * det_z
-                    tr['z_last'] = det_z
-                else:
-                    tr['z_last'] = float('nan')
-
+                self.tracks[best_id]['kf'].update(det[0], det[1])
+                self.tracks[best_id]['last'] = self.frame
             else:
                 kf = SimpleKalman()
-                kf.init(det_xy[0], det_xy[1])
-
-                z_init = det_z if (np.isfinite(det_z) and det_z > 0.0) else self.z_default
+                kf.init(det[0], det[1])
                 self.tracks[self.next_id] = {
                     'kf': kf,
-                    'history': deque([det_xy], maxlen=self.history_len),
+                    'history': deque([det], maxlen=self.history_len),
                     'last': self.frame,
                     'weak_cnt': 0,
-                    'strong_cnt': 0,
-                    'z': float(z_init),        # smoothed z
-                    'z_last': float(det_z),    # latest raw z
+                    'strong_cnt': 0
                 }
                 self.next_id += 1
 
@@ -217,12 +191,7 @@ class TrackerNode(Node):
             pos = tr['kf'].pos()
 
             speed = np.linalg.norm(vel)
-
-            # NOTE:
-            # 今はあなたの元の定義を維持（forward=-vx）
-            # opticalの前方=z なので厳密には z の変化で approach を判定すべきだが、
-            # まずは「距離が正しく出る」ことを優先。
-            forward = -vel[0]
+            forward = -vel[0]          # 仮：x負方向が接近
             lateral = abs(vel[1])
 
             # --- RGB match ---
@@ -259,12 +228,10 @@ class TrackerNode(Node):
             m.id = tid
             m.type = Marker.CUBE
             m.action = Marker.ADD
-
             m.pose.position.x = float(pos[0])
             m.pose.position.y = float(pos[1])
-            m.pose.position.z = float(tr.get('z', self.z_default))  # ★固定0.5を廃止
+            m.pose.position.z = 0.5
             m.pose.orientation.w = 1.0
-
             m.scale.x = m.scale.y = 0.4
             m.scale.z = 1.0
 
@@ -282,9 +249,7 @@ class TrackerNode(Node):
                 m.color.g, m.color.a = 1.0, 0.5
 
             out.markers.append(m)
-
-            z_raw = tr.get('z_last', float('nan'))
-            debug_lines.append(f"{tid}:{state},rgb={rgb_match},z={tr.get('z',float('nan')):.2f},zraw={z_raw if np.isfinite(z_raw) else 'nan'}")
+            debug_lines.append(f"{tid}:{state},rgb={rgb_match}")
 
         self.pub.publish(out)
         self.pub_dbg.publish(String(data=" | ".join(debug_lines)))

@@ -18,7 +18,6 @@ try:
 except Exception:
     HAVE_KDTREE = False
 
-
 def pointcloud2_to_xyz_array(pc2_msg, max_points=None):
     fmt_float = 'f'
     offset = {}
@@ -33,7 +32,6 @@ def pointcloud2_to_xyz_array(pc2_msg, max_points=None):
     n_points = int(len(data) / step) if step > 0 else 0
     if max_points is not None:
         n_points = min(n_points, max_points)
-
     pts = []
     for i in range(n_points):
         base = i * step
@@ -43,21 +41,17 @@ def pointcloud2_to_xyz_array(pc2_msg, max_points=None):
             z = struct.unpack_from(fmt_float, data, base + offset['z'])[0]
         except Exception:
             continue
-
         if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
             continue
         pts.append((x, y, z))
-
     if len(pts) == 0:
         return np.zeros((0, 3), dtype=np.float32)
     return np.asarray(pts, dtype=np.float32)
-
 
 def euclidean_clusters(points, tol=0.08, min_size=10):
     N = points.shape[0]
     if N == 0:
         return []
-
     if HAVE_KDTREE:
         tree = KDTree(points)
         clusters = []
@@ -80,7 +74,6 @@ def euclidean_clusters(points, tol=0.08, min_size=10):
                 clusters.append(np.array(idxs, dtype=int))
         return clusters
     else:
-        # O(N^2) fallback
         dists = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
         visited = np.zeros(N, dtype=bool)
         clusters = []
@@ -102,7 +95,6 @@ def euclidean_clusters(points, tol=0.08, min_size=10):
                 clusters.append(np.array(idxs, dtype=int))
         return clusters
 
-
 class StaticObstacleDetector(Node):
     def __init__(self):
         super().__init__('static_obstacle_detector')
@@ -111,13 +103,7 @@ class StaticObstacleDetector(Node):
         self.declare_parameter('input_topic', '/camera/camera/depth/color/points')
         self.declare_parameter('out_topic', '/static_obstacles')
         self.declare_parameter('voxel_size', 0.05)
-
-        # ground_remove_y:
-        # RealSense optical frame: y is "down".
-        # -1.0 => OFF
-        # >=0  => remove points "below" (large y), keep points with y < ground_remove_y
-        self.declare_parameter('ground_remove_y', -1.0)
-
+        self.declare_parameter('ground_remove_y', -1.0)  # カメラ下方向除去（-1でOFF）
         self.declare_parameter('persistency_window', 2.0)
         self.declare_parameter('persistency_count_thresh', 3)
         self.declare_parameter('cluster_tol', 0.08)
@@ -149,44 +135,33 @@ class StaticObstacleDetector(Node):
         self.pub = self.create_publisher(MarkerArray, self.out_topic, 10)
 
         # history structures
-        self.frames = deque()                 # [(ts, {voxel_id: centroid}), ...]
-        self.voxel_counter = Counter()        # voxel_id -> count in persistency_window
-        self.latest_voxel_centroid = {}       # voxel_id -> latest centroid
-
-        self._last_pc_frame_id = self.frame_id
+        self.frames = deque()
+        self.voxel_counter = Counter()
+        self.latest_voxel_centroid = {}
 
         # timer
         self.timer = self.create_timer(1.0 / max(0.1, self.publish_rate), self.on_timer)
 
-        self.get_logger().info(
-            f"StaticObstacleDetector started. in:{self.input_topic} out:{self.out_topic} "
-            f"voxel={self.voxel_size} persist_window={self.persistency_window}s "
-            f"ground_remove_y={self.ground_remove_y} (y-down, keep y < thresh; -1=OFF)"
-        )
+        self.get_logger().info(f"StaticObstacleDetector started. in:{self.input_topic} out:{self.out_topic} "
+                               f"voxel={self.voxel_size} persist_window={self.persistency_window}s")
 
     def cb_pointcloud(self, msg: PointCloud2):
         pts = pointcloud2_to_xyz_array(msg, max_points=self.max_points_per_frame)
+        self.get_logger().debug(f"PC2 callback raw_count={len(pts)}")
         if pts.shape[0] == 0:
             return
-
-        raw_n = int(pts.shape[0])
 
         # 床除去（カメラ下方向を除去）
-        # optical frame: y is down. Remove "too down" points: y >= thresh
-        # keep only y < ground_remove_y
         if self.ground_remove_y >= 0.0:
-            pts = pts[pts[:, 1] < self.ground_remove_y]
+            mask = pts[:, 1] > self.ground_remove_y
+            pts = pts[mask]
 
         if pts.shape[0] == 0:
-            self.get_logger().debug(f"PC2 raw={raw_n} after_ground=0 (all removed)")
             return
-
-        self.get_logger().debug(f"PC2 raw={raw_n} after_ground={int(pts.shape[0])}")
 
         # voxelization
         inv_vs = 1.0 / self.voxel_size
         idxs = np.floor(pts[:, :3] * inv_vs).astype(np.int32)
-
         voxel_map = {}
         for i, vid in enumerate(map(tuple, idxs)):
             if vid not in voxel_map:
@@ -201,7 +176,6 @@ class StaticObstacleDetector(Node):
 
         ts = time.time()
         self.frames.append((ts, voxel_centroids))
-
         for vid, cent in voxel_centroids.items():
             self.voxel_counter[vid] += 1
             self.latest_voxel_centroid[vid] = cent
@@ -220,10 +194,8 @@ class StaticObstacleDetector(Node):
         self._last_pc_frame_id = msg.header.frame_id if hasattr(msg, 'header') else self.frame_id
 
     def on_timer(self):
-        persistent_voxels = [
-            vid for vid, cnt in self.voxel_counter.items()
-            if cnt >= self.persistency_count_thresh
-        ]
+        persistent_voxels = [vid for vid, cnt in self.voxel_counter.items()
+                             if cnt >= self.persistency_count_thresh]
 
         if len(persistent_voxels) == 0:
             return
@@ -232,27 +204,22 @@ class StaticObstacleDetector(Node):
         for vid in persistent_voxels:
             if vid in self.latest_voxel_centroid:
                 pts.append(self.latest_voxel_centroid[vid])
-
         if len(pts) == 0:
             return
-
         pts_np = np.array(pts, dtype=np.float32)
 
-        clusters_idx = euclidean_clusters(
-            pts_np, tol=self.cluster_tol, min_size=self.min_points_per_cluster
-        )
+        clusters_idx = euclidean_clusters(pts_np, tol=self.cluster_tol, min_size=self.min_points_per_cluster)
 
+        # Build MarkerArray
         markers = MarkerArray()
         stamp = self.get_clock().now().to_msg()
         pub_frame = getattr(self, '_last_pc_frame_id', self.frame_id)
-
         for cid, inds in enumerate(clusters_idx):
             cluster_pts = pts_np[inds]
             centroid = cluster_pts.mean(axis=0)
             mins = cluster_pts.min(axis=0)
             maxs = cluster_pts.max(axis=0)
             size = (maxs - mins)
-
             min_size = 0.05
             size = np.maximum(size, min_size)
 
@@ -285,7 +252,7 @@ class StaticObstacleDetector(Node):
             t.action = Marker.ADD
             t.pose.position.x = float(centroid[0])
             t.pose.position.y = float(centroid[1])
-            t.pose.position.z = float(centroid[2]) + max(float(size[2]), 0.2) + 0.1
+            t.pose.position.z = float(centroid[2]) + max(size[2], 0.2) + 0.1
             t.scale.z = 0.18
             t.color.r = 1.0
             t.color.g = 1.0
@@ -297,11 +264,7 @@ class StaticObstacleDetector(Node):
 
         if len(markers.markers) > 0:
             self.pub.publish(markers)
-            self.get_logger().info(
-                f"Published {len(clusters_idx)} static clusters "
-                f"(markers={len(markers.markers)}) persistent_voxels={len(persistent_voxels)}"
-            )
-
+            self.get_logger().info(f"Published {len(clusters_idx)} static clusters (markers={len(markers.markers)})")
 
 def main(args=None):
     rclpy.init(args=args)
@@ -313,7 +276,3 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
