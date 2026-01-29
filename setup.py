@@ -27,7 +27,7 @@ setup(
         'intent_estimator = scripts.intent_estimator:main',
         'safety_interface = scripts.safety_interface:main',
         'static_obstacle_detector = scripts.static_obstacle_detector:main',
-        'rgb_object_locator = scripts.rgb_object_locator:main',
+        'rgb_motion_gate_filter= scripts.rgb_motion_gate_filter:main',
        
         ],
     },

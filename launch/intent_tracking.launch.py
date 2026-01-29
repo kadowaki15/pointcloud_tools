@@ -27,12 +27,12 @@ def generate_launch_description():
             name='intent_estimator',
             output='screen',
         ),
-        Node(
-            package='pointcloud_tools',
-            executable='safety_interface',
-            name='safety_interface',
-            output='screen',
-        ),
+        #Node(
+         #   package='pointcloud_tools',
+          #  executable='safety_interface',
+           # name='safety_interface',
+            #output='screen',
+        #),
         Node(
             package='pointcloud_tools',
             executable='static_obstacle_detector',
@@ -41,8 +41,8 @@ def generate_launch_description():
         ),
         Node(
             package='pointcloud_tools',
-            executable='rgb_object_locator',
-            name='rgb_object_locator',
+            executable='rgb_motion_gate_filter',
+            name='rgb_motion_gate_filter',
             output='screen',
         ),
        
