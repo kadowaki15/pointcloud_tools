@@ -1,2 +1,0 @@
-pointcloud_tools
-scripts

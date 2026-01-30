@@ -119,12 +119,11 @@ class SafetyInterface(Node):
         self.declare_parameter('kb_estop_enabled', True)
 
         # ---------------- RAPID APPROACH (rate-based stop) ----------------
-        # 急接近検知：dminの減少速度 v_close = (d_old - d_new)/dt が閾値超えでSTOP
         self.declare_parameter('rapid_close_enabled', True)
         self.declare_parameter('rapid_close_v_thresh', 1.0)     # [m/s]
-        self.declare_parameter('rapid_close_dist_max', 1.6)     # [m] この距離より遠いと判定しない
-        self.declare_parameter('rapid_close_window_sec', 0.5)   # [s] この窓の傾きで見る
-        self.declare_parameter('rapid_close_min_samples', 3)    # 窓内最低サンプル数
+        self.declare_parameter('rapid_close_dist_max', 1.6)     # [m]
+        self.declare_parameter('rapid_close_window_sec', 0.5)   # [s]
+        self.declare_parameter('rapid_close_min_samples', 3)
         self.declare_parameter('rapid_close_hold_sec', 1.0)     # ★急接近STOPの保持を1秒に
 
         # load parameters
@@ -172,6 +171,8 @@ class SafetyInterface(Node):
         self._dyn_mode = "NORMAL"      # NORMAL / SLOW / STOP
         self._dyn_lock_until = 0.0
         self._dyn_reason = "NORMAL"
+        # ★追加: “比較用” reason_key（距離など数値で変動しないキー）
+        self._dyn_reason_key = "NORMAL"
 
         # slew output
         self._v_out = 0.0
@@ -184,13 +185,12 @@ class SafetyInterface(Node):
             try:
                 fd = sys.stdin.fileno()
                 self._kb_old_term = termios.tcgetattr(fd)
-                tty.setcbreak(fd)  # 1文字ずつ即取得
+                tty.setcbreak(fd)
                 self.get_logger().warn("Keyboard E-STOP enabled: SPACE=STOP(latch), r=RELEASE  ※この端末がアクティブの時のみ有効")
             except Exception as e:
                 self.get_logger().warn(f"Keyboard E-STOP init failed: {e}")
                 self._kb_old_term = None
 
-            # 20Hz poll
             self._kb_timer = self.create_timer(0.05, self._kb_poll)
 
         self.get_logger().info("safety_interface started (optical-aware, STOP min-hold + rapid-approach STOP enabled)")
@@ -209,7 +209,6 @@ class SafetyInterface(Node):
         self.static_objs = [self._pose_to_base(m) for m in msg.markers]
 
     def cb_intent(self, msg: String):
-        # Expected: tid:state:ttc:v_rad:vx:vy:rng
         parts = msg.data.split(':')
         if len(parts) < 2:
             return
@@ -226,13 +225,11 @@ class SafetyInterface(Node):
         else:
             self._last_cross_rng = float('nan')
 
-        # FAR crossing -> suppress approach briefly
         if (not math.isnan(self._last_cross_rng)) and (float(self._last_cross_rng) >= float(self.cross_slow_dist)):
             self._far_cross_until = max(self._far_cross_until, time.time() + float(self.far_cross_suppress_sec))
 
     # ---------------- keyboard estop ----------------
     def _kb_poll(self):
-        """Non-blocking keyboard poll. Requires this process' terminal focused."""
         if self._kb_old_term is None:
             return
         try:
@@ -251,10 +248,6 @@ class SafetyInterface(Node):
 
     # ---------------- transform ----------------
     def _pose_to_base(self, marker):
-        """
-        TFが取れるなら base_frame へ変換した (x,y,z) を返す。
-        取れないなら marker.pose.position の (x,y,z) をそのまま返す（= optical座標のまま）。
-        """
         if TF2_AVAILABLE and marker.header.frame_id:
             try:
                 ps = PoseStamped()
@@ -370,21 +363,32 @@ class SafetyInterface(Node):
         self._publish(0.0, 0.0)
 
     def _hold_sec_for_mode(self, mode: str, hold_sec: float) -> float:
-        # STOP は最低 stop_min_hold_sec を保証
         if mode == "STOP":
             return max(float(hold_sec), float(self.stop_min_hold_sec))
         return float(hold_sec)
+
+    # ★追加：reason の “比較用キー” を作る（距離など数値変動を無視）
+    def _reason_key(self, reason: str) -> str:
+        # "APPROACH_SLOW d=0.71" -> "APPROACH_SLOW"
+        # "CROSS_SLOW rng=0.72"  -> "CROSS_SLOW"
+        # "EMERGENCY_STOP d=.."  -> "EMERGENCY_STOP"
+        try:
+            return str(reason).split()[0]
+        except Exception:
+            return str(reason)
 
     def _set_hold(self, mode: str, reason: str, hold_sec: float):
         """
         holdの仕様：
         - STOP は最低 stop_min_hold_sec を必ず満たす
         - STOP は「危険が継続しているなら延長してよい」（安全寄り）
-        - SLOW は同reasonで毎tick延長しない（振動防止）
+        - SLOW は同“種類”で毎tick延長しない（振動防止）
+          ※ "APPROACH_SLOW d=0.74" のように距離が変わっても同じ扱いにする
         """
         now = time.time()
         hold_sec = self._hold_sec_for_mode(mode, hold_sec)
         new_until = now + hold_sec
+        key = self._reason_key(reason)
 
         if mode == "STOP":
             # STOPは安全のため延長を許可（ただし短縮はしない）
@@ -392,28 +396,26 @@ class SafetyInterface(Node):
                 if new_until > float(self._dyn_lock_until):
                     self._dyn_lock_until = new_until
                     self._dyn_reason = reason
+                    self._dyn_reason_key = key
                 return
 
-        # それ以外は、同じmode+reasonでlock中なら延長しない
-        if (self._dyn_mode == mode) and (self._dyn_reason == reason) and (now < float(self._dyn_lock_until)):
+        # それ以外（SLOW/NORMALなど）は、
+        # 同じ mode + 同じ reason_key で lock中なら延長しない（距離の揺れで再装填しない）
+        if (self._dyn_mode == mode) and (self._dyn_reason_key == key) and (now < float(self._dyn_lock_until)):
             return
 
         self._dyn_mode = mode
-        self._dyn_reason = reason
+        self._dyn_reason = reason          # 表示用はそのまま（距離入りOK）
+        self._dyn_reason_key = key         # 比較用は距離抜き
         self._dyn_lock_until = new_until
 
     # ---------------- RAPID APPROACH (rate-based) ----------------
     def _rapid_approach_check(self, dmin):
-        """
-        dmin（前方最短距離）の時間変化から接近速度 v_close を推定し、
-        v_close が閾値以上なら急接近として True を返す。
-        """
         if not bool(getattr(self, "rapid_close_enabled", True)):
             return (False, 0.0)
 
         now = time.time()
 
-        # 窓外を掃除する関数
         def _prune():
             w = float(getattr(self, "rapid_close_window_sec", 0.5))
             self._dmin_hist = deque([(t, d) for (t, d) in self._dmin_hist if now - t <= w], maxlen=30)
@@ -423,8 +425,6 @@ class SafetyInterface(Node):
             return (False, 0.0)
 
         d = float(dmin)
-
-        # 遠すぎるものは急接近判定しない（ノイズ対策）
         if d > float(getattr(self, "rapid_close_dist_max", 1.6)):
             _prune()
             return (False, 0.0)
@@ -442,7 +442,7 @@ class SafetyInterface(Node):
         if dt <= 1e-3:
             return (False, 0.0)
 
-        v_close = (float(d0) - float(d1)) / dt  # + なら近づいてる
+        v_close = (float(d0) - float(d1)) / dt
         if v_close >= float(getattr(self, "rapid_close_v_thresh", 1.0)):
             return (True, float(v_close))
 
@@ -480,7 +480,6 @@ class SafetyInterface(Node):
         return self._static_latched, objs
 
     def _free_space_score(self, side, objs):
-        # 実質は「障害物コスト（近いほど大）」: 小さい方が空いている
         score = 0.0
         scan = float(self.lateral_scan_dist)
         for x, y, z in objs:
@@ -493,7 +492,6 @@ class SafetyInterface(Node):
 
     # ---------------- main loop ----------------
     def tick(self):
-        # ===== (Keyboard E-STOP) absolute priority =====
         if bool(getattr(self, "_kb_estop_latched", False)):
             self.pub_state.publish(String(data="E_STOP_KEYBOARD_LATCHED"))
             self._stop()
@@ -532,6 +530,7 @@ class SafetyInterface(Node):
                 if not lock_active:
                     self._dyn_mode = "NORMAL"
                     self._dyn_reason = f"CROSS_FAR_IGNORE rng={rng:.2f}"
+                    self._dyn_reason_key = self._reason_key(self._dyn_reason)
                     self._dyn_lock_until = 0.0
 
             lock_active = now < float(self._dyn_lock_until)
@@ -548,7 +547,6 @@ class SafetyInterface(Node):
 
         # ===== (B) APPROACH (dynamic), suppressed during FAR-cross window =====
         if now < float(self._far_cross_until):
-            # ★重要: FAR_CROSSより lock を優先（急接近STOPしたのに次tickで前進復帰するのを防ぐ）
             if lock_active:
                 lock_remain = max(0.0, float(self._dyn_lock_until) - now)
                 if self._dyn_mode == "STOP":
@@ -560,8 +558,6 @@ class SafetyInterface(Node):
                     self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                     return
 
-            # FAR-cross中は通常のAPPROACH(SLOWなど)は抑制するが、
-            # 「急接近」だけは例外でSTOPさせる（距離0.45m固定で止めない）
             dmin = self._closest_dynamic_front()
             rapid, v_close = self._rapid_approach_check(dmin)
 
@@ -584,7 +580,6 @@ class SafetyInterface(Node):
         else:
             dmin = self._closest_dynamic_front()
 
-            # 急接近なら距離しきい値より優先してSTOP
             rapid, v_close = self._rapid_approach_check(dmin)
             if rapid:
                 self._set_hold(
@@ -597,9 +592,7 @@ class SafetyInterface(Node):
                 self._stop()
                 return
 
-            # lockが残ってる間はSTOP/SLOWを優先
             if lock_active:
-                # lock中にさらに危険になったらSTOPへ格上げ
                 if self._dyn_mode == "SLOW" and dmin is not None and dmin < float(self.stop_dist):
                     self._set_hold("STOP", f"APPROACH_STOP d={dmin:.2f}", float(self.stop_hold_sec))
 
@@ -613,7 +606,6 @@ class SafetyInterface(Node):
                     self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                     return
 
-            # 新規判定（距離ベース）
             if dmin is not None and dmin < float(self.stop_dist):
                 self._set_hold("STOP", f"APPROACH_STOP d={dmin:.2f}", float(self.stop_hold_sec))
                 lock_remain = max(0.0, float(self._dyn_lock_until) - now)
@@ -639,12 +631,9 @@ class SafetyInterface(Node):
             right = self._free_space_score('RIGHT', objs_eff)
             self.pub_state.publish(String(data=f"STATIC_AVOID L:{left:.2f} R:{right:.2f} hold={(max(0.0,self._static_avoid_until-now)):.2f}s"))
 
-            # left/right は「障害物コスト」なので、小さい側（空いてる側）に曲がる
             if left < right:
-                # 左が空いている -> 左旋回（+z）
                 self._publish(0.0, +float(self.avoidance_angular))
             else:
-                # 右が空いている -> 右旋回（-z）
                 self._publish(0.0, -float(self.avoidance_angular))
             return
 
@@ -667,14 +656,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # 終了時に必ず停止を投げる（機体側が最後のTwistを保持する対策）
         try:
             node._stop()
             time.sleep(0.1)
         except Exception:
             pass
 
-        # 端末設定を戻す
         try:
             if getattr(node, "_kb_old_term", None) is not None:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, node._kb_old_term)

@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'pointcloud_tools'
@@ -10,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # ✅ launch を install/share/<pkg>/launch に入れる
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,15 +24,15 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-        'pointcloud_diff = pointcloud_tools.pointcloud_diff:main',
-        'ego_compensator = scripts.ego_compensator:main',
-        'dynamic_cluster_node = scripts.dynamic_cluster_node:main',
-        'tracker = scripts.tracker:main',
-        'intent_estimator = scripts.intent_estimator:main',
-        'safety_interface = scripts.safety_interface:main',
-        'static_obstacle_detector = scripts.static_obstacle_detector:main',
-        'rgb_motion_gate_filter= scripts.rgb_motion_gate_filter:main',
-       
+            'pointcloud_diff = pointcloud_tools.pointcloud_diff:main',
+            'ego_compensator = scripts.ego_compensator:main',
+            'dynamic_cluster_node = scripts.dynamic_cluster_node:main',
+            'tracker = scripts.tracker:main',
+            'intent_estimator = scripts.intent_estimator:main',
+            'safety_interface = scripts.safety_interface:main',
+            'static_obstacle_detector = scripts.static_obstacle_detector:main',
+            # ✅ ここはあなたの実ファイル名に合わせる（たぶんこれ）
+            'rgb_motion_gate_filter = scripts.rgb_motion_gate_filter:main',
         ],
     },
 )

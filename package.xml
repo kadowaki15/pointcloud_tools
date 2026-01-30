@@ -3,10 +3,21 @@
 <package format="3">
   <name>pointcloud_tools</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Pointcloud-based tools (RealSense) for tracking/intention/safety</description>
   <maintainer email="reopi0812@gmail.com">kadowaki</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
+  <!-- ✅ Python package build tool -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- ✅ runtime deps (最低限。あなたのノード群ならほぼ必要) -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+
+  <!-- tests -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

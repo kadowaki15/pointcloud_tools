@@ -8,199 +8,305 @@ import numpy as np
 import time
 import math
 
-def radial_tangential(p, v):
-    """Return (v_rad, v_tan, range).
-    v_rad: positive => moving TOWARD camera (we invert dot sign to make this true).
+
+def radial_tangential(x, z, vx, vz):
+    """Return (v_rad, v_tan, r)
+    v_rad: + means approaching camera (range decreasing)
     """
-    r = np.linalg.norm(p)
+    r = math.hypot(x, z)
     if r < 1e-4:
         return 0.0, 0.0, r
-    u = p / r
-    # make v_rad positive when velocity has component toward camera
-    v_rad = -float(np.dot(v, u))
-    v_tan_vec = v - np.dot(v, u) * u
-    v_tan = float(np.linalg.norm(v_tan_vec))
-    return v_rad, v_tan, r
+    # range rate dr/dt = (x*vx + z*vz)/r
+    dr = (x * vx + z * vz) / r
+    v_rad = -dr  # + => approaching
+    # tangential speed magnitude
+    v_tan_sq = max(0.0, (vx * vx + vz * vz) - (dr * dr))
+    v_tan = math.sqrt(v_tan_sq)
+    return float(v_rad), float(v_tan), float(r)
+
 
 class IntentEstimator(Node):
+    """
+    - Input : /tracked_markers (MarkerArray, ns='tracked')
+    - Output: /object_intents (String) "id:state:vr:vt:vx:vz:r:z"
+    - Viz   : /intent_markers TEXT, "ID{tid}:{state}"  (no TTC)
+    """
+
     def __init__(self):
         super().__init__('intent_estimator')
-        # topics / basic params
+
+        # topics
         self.declare_parameter('input_topic', '/tracked_markers')
         self.declare_parameter('out_topic', '/object_intents')
         self.declare_parameter('viz_topic', '/intent_markers')
-        self.declare_parameter('history_len', 6)
+        self.declare_parameter('history_len', 8)
 
-        # tuned thresholds
-        self.declare_parameter('v_static_thresh', 0.08)   # below = static
-        self.declare_parameter('v_rad_thresh', 0.05)      # minimal radial speed to consider
-        self.declare_parameter('v_tan_thresh', 0.12)      # minimal tangential speed to consider crossing
-        self.declare_parameter('ttc_warn', 2.2)
-        self.declare_parameter('ttc_urgent', 1.0)
+        # thresholds (range-based)
+        self.declare_parameter('v_static_thresh', 0.08)      # m/s (overall) below => static
+        self.declare_parameter('vr_thresh', 0.05)            # m/s radial > => approach
+        self.declare_parameter('vt_thresh', 0.12)            # m/s tangential > => crossing
 
-        # angle-based decision (degrees)
-        self.declare_parameter('approach_angle_deg', 35.0)   # angle <= this => treat as approach-dominant
-        self.declare_parameter('cross_angle_deg', 70.0)     # angle >= this => treat as crossing-dominant
+        # sudden approach (range-based)
+        self.declare_parameter('vr_fast_thresh', 0.22)       # m/s
+        self.declare_parameter('vr_accel_thresh', 0.80)      # m/s^2
+        self.declare_parameter('sudden_confirm_frames', 2)
+        self.declare_parameter('sudden_hold_sec', 0.6)
 
-        # hysteresis / confirmation
-        self.declare_parameter('state_confirm_frames', 2)   # how many consecutive frames to switch
+        # hysteresis
+        self.declare_parameter('state_confirm_frames', 4)
         self.declare_parameter('track_timeout', 2.0)
 
-        # read params
+        # hold approach family to prevent flicker
+        self.declare_parameter('approach_hold_sec', 0.8)
+        self.declare_parameter('leave_approach_vr_away_thresh', 0.02)
+        self.declare_parameter('leave_approach_extra_frames', 2)
+
+        # viz
+        self.declare_parameter('text_scale_z', 0.18)
+        self.declare_parameter('text_lifetime_sec', 1.0)
+        self.declare_parameter('publish_empty', True)
+        self.declare_parameter('suppress_passing_by_output', True)
+
+        # reject (残してOK)
+        self.declare_parameter('reject_origin_xz', True)
+        self.declare_parameter('origin_xz_eps', 0.03)
+        self.declare_parameter('reject_ghost_center', True)
+        self.declare_parameter('ghost_center_x', 0.0)
+        self.declare_parameter('ghost_center_z', 0.5)
+        self.declare_parameter('ghost_eps_x', 0.05)
+        self.declare_parameter('ghost_eps_z', 0.06)
+
+        # read
         self.in_topic = str(self.get_parameter('input_topic').value)
         self.out_topic = str(self.get_parameter('out_topic').value)
         self.viz_topic = str(self.get_parameter('viz_topic').value)
         self.history_len = int(self.get_parameter('history_len').value)
 
         self.v_static_thresh = float(self.get_parameter('v_static_thresh').value)
-        self.v_rad_thresh = float(self.get_parameter('v_rad_thresh').value)
-        self.v_tan_thresh = float(self.get_parameter('v_tan_thresh').value)
-        self.ttc_warn = float(self.get_parameter('ttc_warn').value)
-        self.ttc_urgent = float(self.get_parameter('ttc_urgent').value)
+        self.vr_thresh = float(self.get_parameter('vr_thresh').value)
+        self.vt_thresh = float(self.get_parameter('vt_thresh').value)
 
-        self.approach_angle_deg = float(self.get_parameter('approach_angle_deg').value)
-        self.cross_angle_deg = float(self.get_parameter('cross_angle_deg').value)
+        self.vr_fast_thresh = float(self.get_parameter('vr_fast_thresh').value)
+        self.vr_accel_thresh = float(self.get_parameter('vr_accel_thresh').value)
+        self.sudden_confirm_frames = int(self.get_parameter('sudden_confirm_frames').value)
+        self.sudden_hold_sec = float(self.get_parameter('sudden_hold_sec').value)
 
         self.state_confirm_frames = int(self.get_parameter('state_confirm_frames').value)
         self.track_timeout = float(self.get_parameter('track_timeout').value)
 
-        # ROS pubs/subs
+        self.approach_hold_sec = float(self.get_parameter('approach_hold_sec').value)
+        self.leave_approach_vr_away_thresh = float(self.get_parameter('leave_approach_vr_away_thresh').value)
+        self.leave_approach_extra_frames = int(self.get_parameter('leave_approach_extra_frames').value)
+
+        self.text_scale_z = float(self.get_parameter('text_scale_z').value)
+        self.text_lifetime_sec = float(self.get_parameter('text_lifetime_sec').value)
+        self.publish_empty = bool(self.get_parameter('publish_empty').value)
+        self.suppress_passing_by_output = bool(self.get_parameter('suppress_passing_by_output').value)
+
+        self.reject_origin_xz = bool(self.get_parameter('reject_origin_xz').value)
+        self.origin_xz_eps = float(self.get_parameter('origin_xz_eps').value)
+        self.reject_ghost_center = bool(self.get_parameter('reject_ghost_center').value)
+        self.ghost_center_x = float(self.get_parameter('ghost_center_x').value)
+        self.ghost_center_z = float(self.get_parameter('ghost_center_z').value)
+        self.ghost_eps_x = float(self.get_parameter('ghost_eps_x').value)
+        self.ghost_eps_z = float(self.get_parameter('ghost_eps_z').value)
+
+        # ros
         self.sub = self.create_subscription(MarkerArray, self.in_topic, self.cb_markers, 10)
         self.pub = self.create_publisher(String, self.out_topic, 10)
         self.pub_viz = self.create_publisher(MarkerArray, self.viz_topic, 10)
 
-        # per-track storage: hist, last_seen, state, state_cnt (consecutive candidate count)
-        self.tracks = {}  # tid -> {'hist':deque, 'last_seen':t, 'state':str, 'state_cnt':int}
+        # tracks
+        self.tracks = {}
 
-        self.get_logger().info("IntentEstimator (angle + hysteresis) started")
+        self.get_logger().info("IntentEstimator started (range-based: vr/vt, no TTC text).")
 
-    def _angle_deg(self, v_rad, v_tan):
-        # angle between radial axis and velocity: 0 = directly radial (approach), 90 = purely tangential
-        # guard v_rad>=0 for arctan2
-        return math.degrees(math.atan2(v_tan, max(v_rad, 1e-9)))
+    @staticmethod
+    def _is_approach_family(state: str) -> bool:
+        return state.startswith('approach')
+
+    def _reject_point(self, x: float, z: float) -> bool:
+        if self.reject_origin_xz and (abs(x) < self.origin_xz_eps and abs(z) < self.origin_xz_eps):
+            return True
+        if self.reject_ghost_center:
+            if (abs(x - self.ghost_center_x) < self.ghost_eps_x) and (abs(z - self.ghost_center_z) < self.ghost_eps_z):
+                return True
+        return False
+
+    def _make_delete_marker(self, frame_id: str, stamp, tid: int) -> Marker:
+        m = Marker()
+        m.header.frame_id = frame_id
+        m.header.stamp = stamp
+        m.ns = 'intent'
+        m.id = int(tid)
+        m.action = Marker.DELETE
+        return m
 
     def cb_markers(self, msg: MarkerArray):
         tnow = time.time()
-        # parse markers
+
+        if len(msg.markers) > 0:
+            frame_id = msg.markers[0].header.frame_id or 'camera_depth_optical_frame'
+            stamp = msg.markers[0].header.stamp
+        else:
+            frame_id = 'camera_depth_optical_frame'
+            stamp = self.get_clock().now().to_msg()
+
+        # ingest
         for m in msg.markers:
-            if m.ns not in ('tracked', 'tracked_text'):
+            if m.ns != 'tracked':
                 continue
-            if m.ns == 'tracked_text':
+            if int(m.action) != int(Marker.ADD):
                 continue
+
             tid = int(m.id)
-            px = float(m.pose.position.x)
-            py = float(m.pose.position.y)
+            x = float(m.pose.position.x)
+            z = float(m.pose.position.z)
+            if self._reject_point(x, z):
+                continue
+
             if tid not in self.tracks:
                 self.tracks[tid] = {
                     'hist': deque(maxlen=self.history_len),
                     'last_seen': tnow,
                     'state': 'unknown',
-                    'state_cnt': 0
+                    'cand': 'unknown',
+                    'cand_cnt': 0,
+                    'hold_until': 0.0,
+
+                    # for sudden
+                    'last_vr': 0.0,
+                    'last_vr_t': tnow,
+                    'sudden_cand_cnt': 0,
+                    'sudden_hold_until': 0.0,
                 }
-            self.tracks[tid]['hist'].append((tnow, px, py))
+
+            self.tracks[tid]['hist'].append((tnow, x, z))
             self.tracks[tid]['last_seen'] = tnow
 
-        # remove stale
-        stale = [tid for tid, v in self.tracks.items() if (tnow - v['last_seen']) > self.track_timeout]
-        for s in stale:
-            del self.tracks[s]
+        # stale remove
+        stale_ids = [tid for tid, v in self.tracks.items() if (tnow - v['last_seen']) > self.track_timeout]
+        for tid in stale_ids:
+            del self.tracks[tid]
 
         viz = MarkerArray()
-        # evaluate each track
+        for tid in stale_ids:
+            viz.markers.append(self._make_delete_marker(frame_id, stamp, tid))
+
+        # evaluate
         for tid, info in self.tracks.items():
             hist = list(info['hist'])
             if len(hist) < 2:
                 continue
-            # simple linear velocity estimate over history
-            ts = np.array([h[0] for h in hist])
-            xs = np.array([h[1] for h in hist])
-            ys = np.array([h[2] for h in hist])
-            dt = ts[-1] - ts[0]
+
+            ts = np.array([h[0] for h in hist], dtype=np.float64)
+            xs = np.array([h[1] for h in hist], dtype=np.float32)
+            zs = np.array([h[2] for h in hist], dtype=np.float32)
+
+            dt = float(ts[-1] - ts[0])
             if dt < 1e-4:
                 continue
-            vx = float((xs[-1] - xs[0]) / dt)
-            vy = float((ys[-1] - ys[0]) / dt)
-            p = np.array([xs[-1], ys[-1]])
-            vvec = np.array([vx, vy])
-            speed = float(np.linalg.norm(vvec))
-            v_rad, v_tan, rng = radial_tangential(p, vvec)
-            angle_deg = self._angle_deg(v_rad, v_tan)
 
-            # candidate decision (angle + thresholds)
-            candidate = 'unknown'
-            ttc = float('nan')
+            vx = float((xs[-1] - xs[0]) / dt)
+            vz = float((zs[-1] - zs[0]) / dt)
+
+            x_now = float(xs[-1])
+            z_now = float(zs[-1])
+
+            speed = float(np.hypot(vx, vz))
+            vr, vt, r = radial_tangential(x_now, z_now, vx, vz)  # vr>0 approaching
+
+            # vr accel (for sudden)
+            vr_prev = float(info.get('last_vr', 0.0))
+            t_prev = float(info.get('last_vr_t', tnow))
+            dt_v = max(1e-3, float(tnow - t_prev))
+            vr_accel = (vr - vr_prev) / dt_v
+            info['last_vr'] = vr
+            info['last_vr_t'] = tnow
+
+            # base candidate
             if speed < self.v_static_thresh:
                 candidate = 'static'
             else:
-                # if radial negligible and tangential large => crossing
-                if v_rad < self.v_rad_thresh and v_tan > self.v_tan_thresh:
+                # crossing: tangential dominant, not approaching
+                if vr < self.vr_thresh and vt > self.vt_thresh:
                     candidate = 'crossing'
+                elif vr > self.vr_thresh:
+                    candidate = 'approach'
                 else:
-                    # if radial points away (v_rad <= 0) -> passing_by
-                    if v_rad <= 0.0:
-                        candidate = 'passing_by'
-                    else:
-                        # radial positive: check angle
-                        if angle_deg <= self.approach_angle_deg:
-                            # approach family: evaluate TTC
-                            ttc = rng / v_rad if v_rad > 1e-6 else float('inf')
-                            if ttc < self.ttc_urgent:
-                                candidate = 'approach_urgent'
-                            elif ttc < self.ttc_warn:
-                                candidate = 'approach_warn'
-                            else:
-                                candidate = 'approach'
-                        elif angle_deg >= self.cross_angle_deg:
-                            candidate = 'crossing'
-                        else:
-                            # mid-angle: prefer approach if radial sizeable, else crossing
-                            if v_rad > self.v_rad_thresh:
-                                ttc = rng / v_rad if v_rad > 1e-6 else float('inf')
-                                if ttc < self.ttc_warn:
-                                    candidate = 'approach_warn'
-                                else:
-                                    candidate = 'approach'
-                            else:
-                                candidate = 'crossing'
+                    candidate = 'passing_by'
 
-            # hysteresis: require consecutive candidate frames to switch
-            prev = info.get('state', 'unknown')
-            if candidate == prev:
-                info['state_cnt'] = 0  # reset; already in state
+            # sudden overlay (approach_fast)
+            sudden_now = (vr > self.vr_thresh) and ((vr > self.vr_fast_thresh) or (vr_accel > self.vr_accel_thresh))
+            if sudden_now:
+                info['sudden_cand_cnt'] = info.get('sudden_cand_cnt', 0) + 1
             else:
-                # increment counter (or set to 1 if first time)
-                info['state_cnt'] = info.get('state_cnt', 0) + 1
-                # require N frames to commit change
-                need = self.state_confirm_frames
-                # make leaving 'approach_urgent' harder (optional) — keep symmetric for simplicity
-                if info['state_cnt'] >= need:
-                    info['state'] = candidate
-                    info['state_cnt'] = 0
+                info['sudden_cand_cnt'] = 0
 
-            # publish intent using committed state
-            committed = info['state']
-            # if we haven't committed any state yet, use candidate for immediate feedback
+            if info['sudden_cand_cnt'] >= self.sudden_confirm_frames:
+                info['sudden_hold_until'] = max(info.get('sudden_hold_until', 0.0), tnow + self.sudden_hold_sec)
+
+            if tnow < info.get('sudden_hold_until', 0.0) and candidate.startswith('approach'):
+                candidate = 'approach_fast'
+
+            # hold approach family
+            prev = info.get('state', 'unknown')
+            if self._is_approach_family(candidate):
+                info['hold_until'] = max(info.get('hold_until', 0.0), tnow + self.approach_hold_sec)
+
+            if self._is_approach_family(prev) and (tnow < info.get('hold_until', 0.0)):
+                if not self._is_approach_family(candidate):
+                    candidate = prev
+
+            # stricter leaving approach
+            extra_need = 0
+            if self._is_approach_family(prev) and (not self._is_approach_family(candidate)):
+                # still approaching-ish => keep
+                if vr > self.leave_approach_vr_away_thresh:
+                    candidate = prev
+                else:
+                    extra_need = self.leave_approach_extra_frames
+
+            # hysteresis
+            if candidate == info.get('cand', 'unknown'):
+                info['cand_cnt'] = info.get('cand_cnt', 0) + 1
+            else:
+                info['cand'] = candidate
+                info['cand_cnt'] = 1
+
+            need = int(self.state_confirm_frames + extra_need)
+            if candidate != prev and info['cand_cnt'] >= need:
+                info['state'] = candidate
+                info['cand'] = candidate
+                info['cand_cnt'] = 0
+
+            committed = info.get('state', 'unknown')
             publish_state = committed if committed != 'unknown' else candidate
 
-            out_ttc = ttc if not math.isnan(ttc) else float('nan')
-            outstr = f"{tid}:{publish_state}:{out_ttc:.3f}:{v_rad:.3f}:{vx:.3f}:{vy:.3f}:{rng:.3f}"
-            self.pub.publish(String(data=outstr))
+            if self.suppress_passing_by_output and publish_state == 'passing_by':
+                publish_state = 'unknown'
 
-            # visualization: show approach/crossing/static only (avoid passing_by/unknown)
-            if publish_state in ('passing_by', 'unknown'):
+            # publish string (no TTC)
+            self.pub.publish(String(data=f"{tid}:{publish_state}:{vr:.3f}:{vt:.3f}:{vx:.3f}:{vz:.3f}:{r:.3f}:{z_now:.3f}"))
+
+            # viz
+            if publish_state in ('unknown', 'passing_by'):
                 continue
+
             mm = Marker()
-            mm.header.frame_id = msg.markers[0].header.frame_id if len(msg.markers) > 0 else 'camera_depth_optical_frame'
-            mm.header.stamp = msg.markers[0].header.stamp if len(msg.markers) > 0 else self.get_clock().now().to_msg()
+            mm.header.frame_id = frame_id
+            mm.header.stamp = stamp
             mm.ns = 'intent'
             mm.id = int(tid)
             mm.type = Marker.TEXT_VIEW_FACING
             mm.action = Marker.ADD
-            mm.pose.position.x = float(xs[-1])
-            mm.pose.position.y = float(ys[-1])
-            mm.pose.position.z = 2.0
-            mm.scale.z = 0.22
-            if publish_state.startswith('approach_urgent'):
+
+            mm.pose.position.x = float(x_now)
+            mm.pose.position.y = 0.0
+            mm.pose.position.z = float(z_now)
+            mm.scale.z = float(self.text_scale_z)
+
+            if publish_state == 'approach_fast':
                 mm.color.r, mm.color.g, mm.color.b, mm.color.a = 1.0, 0.0, 0.0, 1.0
             elif publish_state.startswith('approach'):
                 mm.color.r, mm.color.g, mm.color.b, mm.color.a = 1.0, 0.6, 0.0, 1.0
@@ -208,19 +314,19 @@ class IntentEstimator(Node):
                 mm.color.r, mm.color.g, mm.color.b, mm.color.a = 0.0, 0.7, 1.0, 1.0
             elif publish_state == 'static':
                 mm.color.r, mm.color.g, mm.color.b, mm.color.a = 0.0, 1.0, 0.0, 1.0
-            mm.text = f"ID{tid}:{publish_state} a={angle_deg:.0f}"
-            mm.lifetime.sec = 2
-            mm.lifetime.nanosec = 0
+
+            mm.text = f"ID{tid}:{publish_state}"
+
+            sec = int(self.text_lifetime_sec)
+            nsec = int((self.text_lifetime_sec - sec) * 1e9)
+            mm.lifetime.sec = max(0, sec)
+            mm.lifetime.nanosec = max(0, nsec)
+
             viz.markers.append(mm)
 
-            # debug trace
-            self.get_logger().debug(
-                f"TID{tid} candidate={candidate} committed={info.get('state')} "
-                f"v_rad={v_rad:.3f} v_tan={v_tan:.3f} angle={angle_deg:.1f} rng={rng:.2f} speed={speed:.3f}"
-            )
-
-        if len(viz.markers) > 0:
+        if self.publish_empty or (len(viz.markers) > 0):
             self.pub_viz.publish(viz)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -232,6 +338,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
