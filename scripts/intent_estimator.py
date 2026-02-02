@@ -19,7 +19,6 @@ def radial_tangential(x, z, vx, vz):
     # range rate dr/dt = (x*vx + z*vz)/r
     dr = (x * vx + z * vz) / r
     v_rad = -dr  # + => approaching
-    # tangential speed magnitude
     v_tan_sq = max(0.0, (vx * vx + vz * vz) - (dr * dr))
     v_tan = math.sqrt(v_tan_sq)
     return float(v_rad), float(v_tan), float(r)
@@ -27,9 +26,16 @@ def radial_tangential(x, z, vx, vz):
 
 class IntentEstimator(Node):
     """
+    IntentEstimator (ROS2 Humble)
     - Input : /tracked_markers (MarkerArray, ns='tracked')
     - Output: /object_intents (String) "id:state:vr:vt:vx:vz:r:z"
     - Viz   : /intent_markers TEXT, "ID{tid}:{state}"  (no TTC)
+
+    改善点（横切り→approach_fast誤判定を減らす）:
+    - approach_fast を許可するのは「真正面寄り」のときだけ
+      1) vt が小さい（横移動が小さい）
+      2) vr が vt より十分大きい（接近が支配的）
+    - z<=0.05 など「前方距離として壊れている測定」は reject
     """
 
     def __init__(self):
@@ -42,7 +48,7 @@ class IntentEstimator(Node):
         self.declare_parameter('history_len', 8)
 
         # thresholds (range-based)
-        self.declare_parameter('v_static_thresh', 0.08)      # m/s (overall) below => static
+        self.declare_parameter('v_static_thresh', 0.08)      # m/s below => static
         self.declare_parameter('vr_thresh', 0.05)            # m/s radial > => approach
         self.declare_parameter('vt_thresh', 0.12)            # m/s tangential > => crossing
 
@@ -51,6 +57,14 @@ class IntentEstimator(Node):
         self.declare_parameter('vr_accel_thresh', 0.80)      # m/s^2
         self.declare_parameter('sudden_confirm_frames', 2)
         self.declare_parameter('sudden_hold_sec', 0.6)
+
+        # ★ fast を「真正面寄り」に限定するゲート（ここが今回の本命）
+        # 横切りで少し近づくと vr が立つが、vt が大きいなら fast にしない
+        self.declare_parameter('fast_vt_max', 0.20)          # vt がこれ超えたら fast 禁止
+        # vr / (vt+eps) が小さい = 横成分が強い = fast 禁止
+        self.declare_parameter('fast_dir_ratio_min', 3.0)    # まず 3.0 推奨（強め）
+        # fast を見る距離上限（遠距離の揺れで fast が出るのを抑える）
+        self.declare_parameter('fast_r_max', 2.0)            # まず 2.0m
 
         # hysteresis
         self.declare_parameter('state_confirm_frames', 4)
@@ -67,7 +81,7 @@ class IntentEstimator(Node):
         self.declare_parameter('publish_empty', True)
         self.declare_parameter('suppress_passing_by_output', True)
 
-        # reject (残してOK)
+        # reject
         self.declare_parameter('reject_origin_xz', True)
         self.declare_parameter('origin_xz_eps', 0.03)
         self.declare_parameter('reject_ghost_center', True)
@@ -75,6 +89,10 @@ class IntentEstimator(Node):
         self.declare_parameter('ghost_center_z', 0.5)
         self.declare_parameter('ghost_eps_x', 0.05)
         self.declare_parameter('ghost_eps_z', 0.06)
+
+        # ★追加：前方距離として壊れてる測定を捨てる（z<=0 が出ると後段が死ぬ）
+        self.declare_parameter('reject_nonpositive_z', True)
+        self.declare_parameter('min_valid_z', 0.05)          # 5cm未満は無効扱い
 
         # read
         self.in_topic = str(self.get_parameter('input_topic').value)
@@ -90,6 +108,10 @@ class IntentEstimator(Node):
         self.vr_accel_thresh = float(self.get_parameter('vr_accel_thresh').value)
         self.sudden_confirm_frames = int(self.get_parameter('sudden_confirm_frames').value)
         self.sudden_hold_sec = float(self.get_parameter('sudden_hold_sec').value)
+
+        self.fast_vt_max = float(self.get_parameter('fast_vt_max').value)
+        self.fast_dir_ratio_min = float(self.get_parameter('fast_dir_ratio_min').value)
+        self.fast_r_max = float(self.get_parameter('fast_r_max').value)
 
         self.state_confirm_frames = int(self.get_parameter('state_confirm_frames').value)
         self.track_timeout = float(self.get_parameter('track_timeout').value)
@@ -111,6 +133,9 @@ class IntentEstimator(Node):
         self.ghost_eps_x = float(self.get_parameter('ghost_eps_x').value)
         self.ghost_eps_z = float(self.get_parameter('ghost_eps_z').value)
 
+        self.reject_nonpositive_z = bool(self.get_parameter('reject_nonpositive_z').value)
+        self.min_valid_z = float(self.get_parameter('min_valid_z').value)
+
         # ros
         self.sub = self.create_subscription(MarkerArray, self.in_topic, self.cb_markers, 10)
         self.pub = self.create_publisher(String, self.out_topic, 10)
@@ -119,13 +144,18 @@ class IntentEstimator(Node):
         # tracks
         self.tracks = {}
 
-        self.get_logger().info("IntentEstimator started (range-based: vr/vt, no TTC text).")
+        self.get_logger().info(
+            "IntentEstimator started (range-based vr/vt). "
+            f"fast gate: vt<{self.fast_vt_max}, vr/vt>{self.fast_dir_ratio_min}, r<{self.fast_r_max}"
+        )
 
     @staticmethod
     def _is_approach_family(state: str) -> bool:
         return state.startswith('approach')
 
     def _reject_point(self, x: float, z: float) -> bool:
+        if self.reject_nonpositive_z and (z <= self.min_valid_z):
+            return True
         if self.reject_origin_xz and (abs(x) < self.origin_xz_eps and abs(z) < self.origin_xz_eps):
             return True
         if self.reject_ghost_center:
@@ -141,6 +171,19 @@ class IntentEstimator(Node):
         m.id = int(tid)
         m.action = Marker.DELETE
         return m
+
+    def _allow_fast_gate(self, vr: float, vt: float, r: float) -> bool:
+        """approach_fast を許可するか（横切り誤判定を減らすゲート）"""
+        if r <= 1e-3:
+            return False
+        if r > float(self.fast_r_max):
+            return False
+        if vt > float(self.fast_vt_max):
+            return False
+        ratio = float(vr) / max(float(vt), 1e-3)
+        if ratio < float(self.fast_dir_ratio_min):
+            return False
+        return True
 
     def cb_markers(self, msg: MarkerArray):
         tnow = time.time()
@@ -162,6 +205,7 @@ class IntentEstimator(Node):
             tid = int(m.id)
             x = float(m.pose.position.x)
             z = float(m.pose.position.z)
+
             if self._reject_point(x, z):
                 continue
 
@@ -213,6 +257,10 @@ class IntentEstimator(Node):
             x_now = float(xs[-1])
             z_now = float(zs[-1])
 
+            # 念のため（ここで z が壊れてたら publish しない）
+            if self.reject_nonpositive_z and (z_now <= self.min_valid_z):
+                continue
+
             speed = float(np.hypot(vx, vz))
             vr, vt, r = radial_tangential(x_now, z_now, vx, vz)  # vr>0 approaching
 
@@ -228,7 +276,6 @@ class IntentEstimator(Node):
             if speed < self.v_static_thresh:
                 candidate = 'static'
             else:
-                # crossing: tangential dominant, not approaching
                 if vr < self.vr_thresh and vt > self.vt_thresh:
                     candidate = 'crossing'
                 elif vr > self.vr_thresh:
@@ -238,6 +285,12 @@ class IntentEstimator(Node):
 
             # sudden overlay (approach_fast)
             sudden_now = (vr > self.vr_thresh) and ((vr > self.vr_fast_thresh) or (vr_accel > self.vr_accel_thresh))
+
+            # ★追加ゲート：横切りっぽいときは fast を殺す
+            if sudden_now:
+                if not self._allow_fast_gate(vr, vt, r):
+                    sudden_now = False
+
             if sudden_now:
                 info['sudden_cand_cnt'] = info.get('sudden_cand_cnt', 0) + 1
             else:
@@ -246,8 +299,10 @@ class IntentEstimator(Node):
             if info['sudden_cand_cnt'] >= self.sudden_confirm_frames:
                 info['sudden_hold_until'] = max(info.get('sudden_hold_until', 0.0), tnow + self.sudden_hold_sec)
 
-            if tnow < info.get('sudden_hold_until', 0.0) and candidate.startswith('approach'):
-                candidate = 'approach_fast'
+            # sudden hold 中でも、fastゲートを通る時だけ fast にする（横切り誤爆の再発防止）
+            if (tnow < info.get('sudden_hold_until', 0.0)) and candidate.startswith('approach'):
+                if self._allow_fast_gate(vr, vt, r):
+                    candidate = 'approach_fast'
 
             # hold approach family
             prev = info.get('state', 'unknown')
@@ -261,7 +316,6 @@ class IntentEstimator(Node):
             # stricter leaving approach
             extra_need = 0
             if self._is_approach_family(prev) and (not self._is_approach_family(candidate)):
-                # still approaching-ish => keep
                 if vr > self.leave_approach_vr_away_thresh:
                     candidate = prev
                 else:
@@ -286,8 +340,10 @@ class IntentEstimator(Node):
             if self.suppress_passing_by_output and publish_state == 'passing_by':
                 publish_state = 'unknown'
 
-            # publish string (no TTC)
-            self.pub.publish(String(data=f"{tid}:{publish_state}:{vr:.3f}:{vt:.3f}:{vx:.3f}:{vz:.3f}:{r:.3f}:{z_now:.3f}"))
+            # publish string
+            self.pub.publish(String(
+                data=f"{tid}:{publish_state}:{vr:.3f}:{vt:.3f}:{vx:.3f}:{vz:.3f}:{r:.3f}:{z_now:.3f}"
+            ))
 
             # viz
             if publish_state in ('unknown', 'passing_by'):

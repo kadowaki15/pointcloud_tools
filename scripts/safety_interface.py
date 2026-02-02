@@ -7,18 +7,16 @@ safety_interface (ROS2 Humble)
 - /tf_static は RealSense が出している（静的TFのみ）
 - /tracked_markers は frame_id = camera_depth_optical_frame（optical座標）
 
-この版は optical座標の軸（前方=z, 左右=x）に合わせて距離判定を行い、
-「危険でSTOPしたら最低 stop_min_hold_sec は停止を維持」する。
+この版の狙い:
+- /object_intents の approach / approach_fast / crossing を safety 側でも確実に拾う
+  /object_intents フォーマット: "id:state:vr:vt:vx:vz:r:z"
+- 横切り (vt大) を急接近STOPにしにくい（vt上限 + vr/vt比ゲート）
+- far crossing の最中は「普通のapproach減速」は抑制しつつ、
+  近距離STOPと approach_fast STOP は通す（安全側）
 
-追加（キーボードE-STOP）:
-- SPACE: 停止をラッチ（/cmd_vel_safe を必ず 0 にする）
-- r    : ラッチ解除
-※このノードを起動している端末がアクティブな時だけ効く
-
-追加（急接近 STOP）:
-- dmin（前方最短距離）の減少速度 v_close=(d_old-d_new)/dt が閾値を超えたら STOP
-- FAR_CROSS_SUPPRESS_APPROACH 中でも「急接近」だけは STOP させる（距離0.45m固定では止めない）
-- 急接近STOPしたら最低1秒停止（lock優先：FAR_CROSSがlockを上書きして前進復帰しないように修正）
+安全状態出力:
+- /safety_state に String を publish
+- /cmd_vel_safe に Twist を publish
 """
 
 import rclpy
@@ -71,27 +69,51 @@ class SafetyInterface(Node):
 
         # Emergency gate (front corridor)
         # optical前提: 前方=z、左右=x として扱う
-        self.declare_parameter('emg_gate_x_max', 0.80)   # = z_max
-        self.declare_parameter('emg_gate_y_half', 0.45)  # = x_half
+        self.declare_parameter('emg_gate_z_max', 0.80)
+        self.declare_parameter('emg_gate_x_half', 0.45)
 
-        # ---------------- APPROACH (dynamic) ----------------
+        # ---------------- APPROACH (dynamic distance gate) ----------------
+        # tracked_markers の前方最短 z に基づく最終安全（intent が壊れても止まる）
         self.declare_parameter('stop_dist', 0.45)
         self.declare_parameter('slow_dist', 1.00)
-
         self.declare_parameter('stop_hold_sec', 1.5)
         self.declare_parameter('slow_hold_sec', 1.2)
 
-        # approach gate（optical前提: z_min/z_max として解釈）
-        self.declare_parameter('dyn_gate_x_min', 0.10)  # = z_min
-        self.declare_parameter('dyn_gate_x_max', 2.00)  # = z_max
-        self.declare_parameter('dyn_gate_y_half', 0.45) # = x_half
+        # tracked_markers を見るゲート（optical: z前方, x左右）
+        self.declare_parameter('dyn_gate_z_min', 0.10)
+        self.declare_parameter('dyn_gate_z_max', 2.00)
+        self.declare_parameter('dyn_gate_x_half', 0.45)
+
+        # ---------------- INTENT-based APPROACH ----------------
+        # /object_intents の approach/approach_fast を safety_state に反映する
+        self.declare_parameter('intent_cache_sec', 0.6)
+        self.declare_parameter('intent_use_r_for_cross', True)   # crossing距離は r を使う
+        self.declare_parameter('intent_use_z_for_approach', True) # approach距離は z を使う（無ければr）
+
+        # approach: 遠ければ原則無視、近ければ STOP
+        self.declare_parameter('intent_approach_slow_dist', 1.0)  # ここより遠いapproachは基本無視
+        self.declare_parameter('intent_approach_stop_dist', 0.55) # approachでこの距離未満ならSTOP（tracked側stop_distと整合取りやすい）
+        self.declare_parameter('intent_approach_slow_hold_sec', 0.8)
+        self.declare_parameter('intent_approach_stop_hold_sec', 1.2)
+
+        # approach_fast: “急接近STOP”
+        self.declare_parameter('intent_fast_enabled', True)
+        self.declare_parameter('intent_fast_r_max', 1.8)         # 遠距離のfastは無視
+        self.declare_parameter('intent_fast_vr_min', 0.35)       # vrがこれ未満ならfast扱いしない（誤爆減）
+        self.declare_parameter('intent_fast_vt_max', 0.20)       # vtがこれ超なら横切り寄り => fast無効
+        self.declare_parameter('intent_fast_dir_ratio_min', 4.0) # vr/(vt+eps) がこれ未満ならfast無効
+        self.declare_parameter('intent_fast_hold_sec', 1.0)
 
         # ---------------- CROSSING ----------------
+        # crossing は intent の距離(r or z)を使って near-only で STOP/SLOW
         self.declare_parameter('cross_stop_dist', 0.35)
         self.declare_parameter('cross_slow_dist', 0.80)
         self.declare_parameter('cross_hold_sec', 0.6)
         self.declare_parameter('cross_cache_sec', 0.8)
         self.declare_parameter('far_cross_suppress_sec', 0.8)
+
+        # far-cross suppress中に許可する最終安全STOP距離（これ未満なら抑制を無視してSTOP）
+        self.declare_parameter('suppress_override_stop_dist', 0.55)
 
         # ---------------- output smoothing ----------------
         self.declare_parameter('use_slew_limiter', True)
@@ -118,15 +140,11 @@ class SafetyInterface(Node):
         # ---------------- Keyboard E-STOP ----------------
         self.declare_parameter('kb_estop_enabled', True)
 
-        # ---------------- RAPID APPROACH (rate-based stop) ----------------
-        self.declare_parameter('rapid_close_enabled', True)
-        self.declare_parameter('rapid_close_v_thresh', 1.0)     # [m/s]
-        self.declare_parameter('rapid_close_dist_max', 1.6)     # [m]
-        self.declare_parameter('rapid_close_window_sec', 0.5)   # [s]
-        self.declare_parameter('rapid_close_min_samples', 3)
-        self.declare_parameter('rapid_close_hold_sec', 1.0)     # ★急接近STOPの保持を1秒に
+        # ---------------- Robust intent parsing ----------------
+        self.declare_parameter('reject_nonpositive_dist', True)
+        self.declare_parameter('min_valid_dist', 0.05)
 
-        # load parameters
+        # load parameters (ROS2 internal)
         for p in self._parameters:
             setattr(self, p, self.get_parameter(p).value)
         self.tick_dt = float(self.get_parameter('tick_dt').value)
@@ -151,9 +169,6 @@ class SafetyInterface(Node):
         self.latest_cmd = Twist()
         self.recent_tracked = deque(maxlen=10)
 
-        # rapid-approach history: (t, dmin)
-        self._dmin_hist = deque(maxlen=30)
-
         # static
         self.static_objs = []
         self._last_static_time = 0.0
@@ -162,25 +177,32 @@ class SafetyInterface(Node):
         self._static_false_cnt = 0
         self._static_avoid_until = 0.0
 
-        # intent cache for crossing
+        # crossing cache (intent)
         self._last_cross_time = 0.0
         self._last_cross_rng = float('nan')
         self._far_cross_until = 0.0
+
+        # approach cache (intent)
+        self._intent_last = {}  # tid -> dict(t, state, vr, vt, r, z)
+        self._last_approach_time = 0.0
+        self._last_approach_dist = float('nan')
+        self._last_fast_time = 0.0
+        self._last_fast_dist = float('nan')
+        self._last_fast_vr = 0.0
+        self._last_fast_vt = 0.0
 
         # dynamic hold
         self._dyn_mode = "NORMAL"      # NORMAL / SLOW / STOP
         self._dyn_lock_until = 0.0
         self._dyn_reason = "NORMAL"
-        # ★追加: “比較用” reason_key（距離など数値で変動しないキー）
         self._dyn_reason_key = "NORMAL"
 
         # slew output
         self._v_out = 0.0
 
-        # ---------------- Keyboard E-STOP state ----------------
+        # Keyboard E-STOP
         self._kb_estop_latched = False
         self._kb_old_term = None
-
         if bool(self.kb_estop_enabled):
             try:
                 fd = sys.stdin.fileno()
@@ -190,10 +212,9 @@ class SafetyInterface(Node):
             except Exception as e:
                 self.get_logger().warn(f"Keyboard E-STOP init failed: {e}")
                 self._kb_old_term = None
-
             self._kb_timer = self.create_timer(0.05, self._kb_poll)
 
-        self.get_logger().info("safety_interface started (optical-aware, STOP min-hold + rapid-approach STOP enabled)")
+        self.get_logger().info("safety_interface started (intent-aware: crossing/approach/approach_fast + robust parsing)")
 
     # ---------------- callbacks ----------------
     def cb_cmd(self, msg: Twist):
@@ -208,25 +229,76 @@ class SafetyInterface(Node):
         self._last_static_time = time.time()
         self.static_objs = [self._pose_to_base(m) for m in msg.markers]
 
+    def _safe_float(self, s, default=float('nan')):
+        try:
+            return float(s)
+        except Exception:
+            return default
+
     def cb_intent(self, msg: String):
+        """
+        /object_intents:
+          "id:state:vr:vt:vx:vz:r:z"
+        state: crossing / approach / approach_fast / static / unknown etc
+        """
         parts = msg.data.split(':')
         if len(parts) < 2:
             return
-        state = parts[1]
-        if 'crossing' not in state:
-            return
 
-        self._last_cross_time = time.time()
-        if len(parts) >= 7:
-            try:
-                self._last_cross_rng = float(parts[6])
-            except Exception:
-                self._last_cross_rng = float('nan')
-        else:
-            self._last_cross_rng = float('nan')
+        tid = None
+        try:
+            tid = int(parts[0])
+        except Exception:
+            tid = None
 
-        if (not math.isnan(self._last_cross_rng)) and (float(self._last_cross_rng) >= float(self.cross_slow_dist)):
-            self._far_cross_until = max(self._far_cross_until, time.time() + float(self.far_cross_suppress_sec))
+        state = str(parts[1]).strip()
+        now = time.time()
+
+        # 8項目想定。足りなくても末尾から取れるようにする。
+        vr = self._safe_float(parts[2]) if len(parts) > 2 else float('nan')
+        vt = self._safe_float(parts[3]) if len(parts) > 3 else float('nan')
+        r  = self._safe_float(parts[6]) if len(parts) > 6 else self._safe_float(parts[-2]) if len(parts) >= 2 else float('nan')
+        z  = self._safe_float(parts[7]) if len(parts) > 7 else self._safe_float(parts[-1])
+
+        # dist choice
+        cross_dist = r if bool(self.intent_use_r_for_cross) else z
+        app_dist   = z if bool(self.intent_use_z_for_approach) else r
+        if math.isnan(app_dist):
+            app_dist = r
+
+        # reject broken distances
+        if bool(self.reject_nonpositive_dist):
+            if (not math.isnan(cross_dist)) and (cross_dist <= float(self.min_valid_dist)):
+                # crossing距離が壊れてる（0や負） => 使わない
+                cross_dist = float('nan')
+            if (not math.isnan(app_dist)) and (app_dist <= float(self.min_valid_dist)):
+                app_dist = float('nan')
+
+        if tid is not None:
+            self._intent_last[tid] = {'t': now, 'state': state, 'vr': vr, 'vt': vt, 'r': r, 'z': z}
+
+        # cache crossing
+        if 'crossing' in state:
+            if not math.isnan(cross_dist):
+                self._last_cross_time = now
+                self._last_cross_rng = float(cross_dist)
+                # far crossing を検知したら approach 抑制窓
+                if float(cross_dist) >= float(self.cross_slow_dist):
+                    self._far_cross_until = max(self._far_cross_until, now + float(self.far_cross_suppress_sec))
+
+        # cache approach
+        if state.startswith('approach'):
+            if not math.isnan(app_dist):
+                self._last_approach_time = now
+                self._last_approach_dist = float(app_dist)
+
+        # cache approach_fast
+        if state == 'approach_fast':
+            if not math.isnan(app_dist):
+                self._last_fast_time = now
+                self._last_fast_dist = float(app_dist)
+                self._last_fast_vr = 0.0 if math.isnan(vr) else float(vr)
+                self._last_fast_vt = 0.0 if math.isnan(vt) else float(vt)
 
     # ---------------- keyboard estop ----------------
     def _kb_poll(self):
@@ -253,8 +325,7 @@ class SafetyInterface(Node):
                 ps = PoseStamped()
                 ps.header = marker.header
                 ps.pose = marker.pose
-                tr = self.tf_buffer.lookup_transform(
-                    self.base_frame, marker.header.frame_id, rclpy.time.Time())
+                tr = self.tf_buffer.lookup_transform(self.base_frame, marker.header.frame_id, rclpy.time.Time())
                 out = tf2_geometry_msgs.do_transform_pose(ps, tr)
                 p = out.pose.position
                 return (float(p.x), float(p.y), float(p.z))
@@ -267,12 +338,15 @@ class SafetyInterface(Node):
 
     # ---------------- helpers ----------------
     def _closest_dynamic_front(self):
+        """
+        tracked_markers の点群から、前方ゲート内で最短の z を返す
+        """
         now = time.time()
         dmin = None
 
-        z_min = float(self.dyn_gate_x_min)
-        z_max = float(self.dyn_gate_x_max)
-        x_half = float(self.dyn_gate_y_half)
+        z_min = float(self.dyn_gate_z_min)
+        z_max = float(self.dyn_gate_z_max)
+        x_half = float(self.dyn_gate_x_half)
 
         for t, pts in self.recent_tracked:
             if now - t > 1.2:
@@ -294,14 +368,17 @@ class SafetyInterface(Node):
             return self.static_objs
         return []
 
-    def _closest_static_front(self):
+    def _closest_static_front_emg(self):
+        """
+        static_obstacles の前方ゲート内最短 z
+        """
         objs = self._static_effective_objs()
         if not objs:
             return None
 
         dmin = None
-        z_max = float(self.emg_gate_x_max)
-        x_half = float(self.emg_gate_y_half)
+        z_max = float(self.emg_gate_z_max)
+        x_half = float(self.emg_gate_x_half)
 
         for x, y, z in objs:
             if z <= 0.0:
@@ -316,10 +393,13 @@ class SafetyInterface(Node):
         return dmin
 
     def _closest_dynamic_front_emg(self):
+        """
+        tracked_markers の前方ゲート内最短 z（emergency用に短い履歴だけ見る）
+        """
         now = time.time()
         dmin = None
-        z_max = float(self.emg_gate_x_max)
-        x_half = float(self.emg_gate_y_half)
+        z_max = float(self.emg_gate_z_max)
+        x_half = float(self.emg_gate_x_half)
 
         for t, pts in self.recent_tracked:
             if now - t > 1.0:
@@ -367,31 +447,19 @@ class SafetyInterface(Node):
             return max(float(hold_sec), float(self.stop_min_hold_sec))
         return float(hold_sec)
 
-    # ★追加：reason の “比較用キー” を作る（距離など数値変動を無視）
     def _reason_key(self, reason: str) -> str:
-        # "APPROACH_SLOW d=0.71" -> "APPROACH_SLOW"
-        # "CROSS_SLOW rng=0.72"  -> "CROSS_SLOW"
-        # "EMERGENCY_STOP d=.."  -> "EMERGENCY_STOP"
         try:
             return str(reason).split()[0]
         except Exception:
             return str(reason)
 
     def _set_hold(self, mode: str, reason: str, hold_sec: float):
-        """
-        holdの仕様：
-        - STOP は最低 stop_min_hold_sec を必ず満たす
-        - STOP は「危険が継続しているなら延長してよい」（安全寄り）
-        - SLOW は同“種類”で毎tick延長しない（振動防止）
-          ※ "APPROACH_SLOW d=0.74" のように距離が変わっても同じ扱いにする
-        """
         now = time.time()
         hold_sec = self._hold_sec_for_mode(mode, hold_sec)
         new_until = now + hold_sec
         key = self._reason_key(reason)
 
         if mode == "STOP":
-            # STOPは安全のため延長を許可（ただし短縮はしない）
             if self._dyn_mode == "STOP":
                 if new_until > float(self._dyn_lock_until):
                     self._dyn_lock_until = new_until
@@ -399,54 +467,63 @@ class SafetyInterface(Node):
                     self._dyn_reason_key = key
                 return
 
-        # それ以外（SLOW/NORMALなど）は、
-        # 同じ mode + 同じ reason_key で lock中なら延長しない（距離の揺れで再装填しない）
         if (self._dyn_mode == mode) and (self._dyn_reason_key == key) and (now < float(self._dyn_lock_until)):
             return
 
         self._dyn_mode = mode
-        self._dyn_reason = reason          # 表示用はそのまま（距離入りOK）
-        self._dyn_reason_key = key         # 比較用は距離抜き
+        self._dyn_reason = reason
+        self._dyn_reason_key = key
         self._dyn_lock_until = new_until
 
-    # ---------------- RAPID APPROACH (rate-based) ----------------
-    def _rapid_approach_check(self, dmin):
-        if not bool(getattr(self, "rapid_close_enabled", True)):
-            return (False, 0.0)
+    def _intent_fast_should_stop(self, now: float) -> bool:
+        """
+        intent approach_fast を STOP に使う（横切り誤爆を抑えるゲート付き）
+        """
+        if not bool(self.intent_fast_enabled):
+            return False
+        if (now - float(self._last_fast_time)) > float(self.intent_cache_sec):
+            return False
 
-        now = time.time()
+        d = float(self._last_fast_dist)
+        if math.isnan(d) or d <= float(self.min_valid_dist):
+            return False
+        if d > float(self.intent_fast_r_max):
+            return False
 
-        def _prune():
-            w = float(getattr(self, "rapid_close_window_sec", 0.5))
-            self._dmin_hist = deque([(t, d) for (t, d) in self._dmin_hist if now - t <= w], maxlen=30)
+        vr = float(self._last_fast_vr)
+        vt = float(self._last_fast_vt)
 
-        if dmin is None:
-            _prune()
-            return (False, 0.0)
+        if vr < float(self.intent_fast_vr_min):
+            return False
+        if vt > float(self.intent_fast_vt_max):
+            return False
 
-        d = float(dmin)
-        if d > float(getattr(self, "rapid_close_dist_max", 1.6)):
-            _prune()
-            return (False, 0.0)
+        ratio = vr / max(abs(vt), 1e-3)
+        if ratio < float(self.intent_fast_dir_ratio_min):
+            return False
 
-        self._dmin_hist.append((now, d))
-        _prune()
+        return True
 
-        pts = list(self._dmin_hist)
-        if len(pts) < int(getattr(self, "rapid_close_min_samples", 3)):
-            return (False, 0.0)
+    def _intent_approach_action(self, now: float):
+        """
+        intent approach を距離で STOP / SLOW / IGNORE に分類
+        """
+        if (now - float(self._last_approach_time)) > float(self.intent_cache_sec):
+            return ("NONE", float('nan'))
 
-        t0, d0 = pts[0]
-        t1, d1 = pts[-1]
-        dt = float(t1 - t0)
-        if dt <= 1e-3:
-            return (False, 0.0)
+        d = float(self._last_approach_dist)
+        if math.isnan(d) or d <= float(self.min_valid_dist):
+            return ("NONE", d)
 
-        v_close = (float(d0) - float(d1)) / dt
-        if v_close >= float(getattr(self, "rapid_close_v_thresh", 1.0)):
-            return (True, float(v_close))
+        # 遠距離の approach は原則無視（あなたの要望）
+        if d > float(self.intent_approach_slow_dist):
+            return ("IGNORE", d)
 
-        return (False, float(v_close))
+        if d < float(self.intent_approach_stop_dist):
+            return ("STOP", d)
+
+        # ここに入るのは「近いが、停止ほどではない」
+        return ("SLOW", d)
 
     # ---------------- STATIC latch ----------------
     def _static_raw_on(self, objs):
@@ -503,7 +580,7 @@ class SafetyInterface(Node):
 
         # ===== (0) EMERGENCY STOP (highest priority) =====
         d_dyn_emg = self._closest_dynamic_front_emg()
-        d_sta_emg = self._closest_static_front()
+        d_sta_emg = self._closest_static_front_emg()
         d_any = None
         if d_dyn_emg is not None:
             d_any = d_dyn_emg
@@ -517,9 +594,27 @@ class SafetyInterface(Node):
             self._stop()
             return
 
-        # ===== (A) CROSSING near-only =====
+        # ===== (1) INTENT APPROACH_FAST STOP (ゲート付き) =====
+        if self._intent_fast_should_stop(now):
+            d = float(self._last_fast_dist)
+            self._set_hold("STOP", f"INTENT_APPROACH_FAST d={d:.2f}", float(self.intent_fast_hold_sec))
+            lock_remain = max(0.0, float(self._dyn_lock_until) - now)
+            self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
+            self._stop()
+            return
+
+        # tracked 最終安全: suppress中でも “近距離はSTOP”
+        dmin_track = self._closest_dynamic_front()
+        if dmin_track is not None and dmin_track < float(self.suppress_override_stop_dist):
+            self._set_hold("STOP", f"TRACK_STOP d={dmin_track:.2f}", float(self.stop_hold_sec))
+            lock_remain = max(0.0, float(self._dyn_lock_until) - now)
+            self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
+            self._stop()
+            return
+
+        # ===== (2) CROSSING near-only (intent距離) =====
         cross_recent = (now - float(self._last_cross_time)) < float(self.cross_cache_sec)
-        if cross_recent and not math.isnan(self._last_cross_rng):
+        if cross_recent and (not math.isnan(self._last_cross_rng)):
             rng = float(self._last_cross_rng)
 
             if rng < float(self.cross_stop_dist):
@@ -527,6 +622,7 @@ class SafetyInterface(Node):
             elif rng < float(self.cross_slow_dist):
                 self._set_hold("SLOW", f"CROSS_SLOW rng={rng:.2f}", float(self.cross_hold_sec))
             else:
+                # far crossing は基本無視（速度変えない）
                 if not lock_active:
                     self._dyn_mode = "NORMAL"
                     self._dyn_reason = f"CROSS_FAR_IGNORE rng={rng:.2f}"
@@ -545,28 +641,28 @@ class SafetyInterface(Node):
                 self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                 return
 
-        # ===== (B) APPROACH (dynamic), suppressed during FAR-cross window =====
-        if now < float(self._far_cross_until):
-            if lock_active:
-                lock_remain = max(0.0, float(self._dyn_lock_until) - now)
-                if self._dyn_mode == "STOP":
-                    self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
-                    self._stop()
-                    return
-                if self._dyn_mode == "SLOW":
-                    self.pub_state.publish(String(data=f"DYN_SLOW {self._dyn_reason} lock={lock_remain:.2f}s"))
-                    self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
-                    return
+        # ===== (3) APPROACH: far-cross suppress window =====
+        suppress = now < float(self._far_cross_until)
 
-            dmin = self._closest_dynamic_front()
-            rapid, v_close = self._rapid_approach_check(dmin)
+        # lock 継続（SLOW/STOP を維持）
+        if lock_active:
+            lock_remain = max(0.0, float(self._dyn_lock_until) - now)
+            if self._dyn_mode == "STOP":
+                self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
+                self._stop()
+                return
+            if self._dyn_mode == "SLOW":
+                self.pub_state.publish(String(data=f"DYN_SLOW {self._dyn_reason} lock={lock_remain:.2f}s"))
+                self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
+                return
 
-            if rapid:
-                self._set_hold(
-                    "STOP",
-                    f"RAPID_APPROACH v={v_close:.2f} d={float(dmin):.2f}",
-                    float(self.rapid_close_hold_sec)
-                )
+        # intent approach を反映（ただし suppress中は “遠距離SLOW” を抑制）
+        act, d_app = self._intent_approach_action(now)
+
+        if suppress:
+            # suppress中: 近距離STOPだけ通す（SLOWは基本抑制）
+            if act == "STOP":
+                self._set_hold("STOP", f"INTENT_APPROACH_STOP d={d_app:.2f}", float(self.intent_approach_stop_hold_sec))
                 lock_remain = max(0.0, float(self._dyn_lock_until) - now)
                 self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
                 self._stop()
@@ -574,53 +670,40 @@ class SafetyInterface(Node):
 
             v_in = float(self.latest_cmd.linear.x)
             v_cmd = v_in if abs(v_in) > 1e-6 else float(self.default_speed)
-            self.pub_state.publish(String(data=f"FAR_CROSS_SUPPRESS_APPROACH vclose={v_close:.2f}"))
+            self.pub_state.publish(String(data=f"FAR_CROSS_SUPPRESS_APPROACH"))
             self._publish(v_cmd, float(self.latest_cmd.angular.z))
             return
         else:
-            dmin = self._closest_dynamic_front()
-
-            rapid, v_close = self._rapid_approach_check(dmin)
-            if rapid:
-                self._set_hold(
-                    "STOP",
-                    f"RAPID_APPROACH v={v_close:.2f} d={float(dmin):.2f}",
-                    float(self.rapid_close_hold_sec)
-                )
+            # suppress外: intent approach で STOP/SLOW を出す
+            if act == "STOP":
+                self._set_hold("STOP", f"INTENT_APPROACH_STOP d={d_app:.2f}", float(self.intent_approach_stop_hold_sec))
                 lock_remain = max(0.0, float(self._dyn_lock_until) - now)
                 self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
                 self._stop()
                 return
-
-            if lock_active:
-                if self._dyn_mode == "SLOW" and dmin is not None and dmin < float(self.stop_dist):
-                    self._set_hold("STOP", f"APPROACH_STOP d={dmin:.2f}", float(self.stop_hold_sec))
-
-                lock_remain = max(0.0, float(self._dyn_lock_until) - now)
-                if self._dyn_mode == "STOP":
-                    self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
-                    self._stop()
-                    return
-                if self._dyn_mode == "SLOW":
-                    self.pub_state.publish(String(data=f"DYN_SLOW {self._dyn_reason} lock={lock_remain:.2f}s"))
-                    self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
-                    return
-
-            if dmin is not None and dmin < float(self.stop_dist):
-                self._set_hold("STOP", f"APPROACH_STOP d={dmin:.2f}", float(self.stop_hold_sec))
-                lock_remain = max(0.0, float(self._dyn_lock_until) - now)
-                self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
-                self._stop()
-                return
-
-            if dmin is not None and dmin < float(self.slow_dist):
-                self._set_hold("SLOW", f"APPROACH_SLOW d={dmin:.2f}", float(self.slow_hold_sec))
+            if act == "SLOW":
+                self._set_hold("SLOW", f"INTENT_APPROACH_SLOW d={d_app:.2f}", float(self.intent_approach_slow_hold_sec))
                 lock_remain = max(0.0, float(self._dyn_lock_until) - now)
                 self.pub_state.publish(String(data=f"DYN_SLOW {self._dyn_reason} lock={lock_remain:.2f}s"))
                 self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
                 return
 
-        # ===== (C) STATIC avoid + extra hold =====
+            # ここまで来たら intent は無視 or そもそも来てない
+            # tracked_markers の距離で最終安全をかける（近いならSTOP/SLOW）
+            if dmin_track is not None and dmin_track < float(self.stop_dist):
+                self._set_hold("STOP", f"TRACK_STOP d={dmin_track:.2f}", float(self.stop_hold_sec))
+                lock_remain = max(0.0, float(self._dyn_lock_until) - now)
+                self.pub_state.publish(String(data=f"DYN_STOP {self._dyn_reason} lock={lock_remain:.2f}s"))
+                self._stop()
+                return
+            if dmin_track is not None and dmin_track < float(self.slow_dist):
+                self._set_hold("SLOW", f"TRACK_SLOW d={dmin_track:.2f}", float(self.slow_hold_sec))
+                lock_remain = max(0.0, float(self._dyn_lock_until) - now)
+                self.pub_state.publish(String(data=f"DYN_SLOW {self._dyn_reason} lock={lock_remain:.2f}s"))
+                self._publish(float(self.slow_speed), float(self.latest_cmd.angular.z))
+                return
+
+        # ===== (4) STATIC avoid + extra hold =====
         static_on, objs = self._update_static_latch()
         if static_on:
             self._static_avoid_until = max(self._static_avoid_until, now + float(self.static_avoid_hold_sec))
@@ -629,7 +712,9 @@ class SafetyInterface(Node):
             objs_eff = objs if objs else self._static_effective_objs()
             left = self._free_space_score('LEFT', objs_eff)
             right = self._free_space_score('RIGHT', objs_eff)
-            self.pub_state.publish(String(data=f"STATIC_AVOID L:{left:.2f} R:{right:.2f} hold={(max(0.0,self._static_avoid_until-now)):.2f}s"))
+            self.pub_state.publish(String(
+                data=f"STATIC_AVOID L:{left:.2f} R:{right:.2f} hold={(max(0.0,self._static_avoid_until-now)):.2f}s"
+            ))
 
             if left < right:
                 self._publish(0.0, +float(self.avoidance_angular))
@@ -637,7 +722,7 @@ class SafetyInterface(Node):
                 self._publish(0.0, -float(self.avoidance_angular))
             return
 
-        # ===== (D) NORMAL =====
+        # ===== (5) NORMAL =====
         v_in = float(self.latest_cmd.linear.x)
         v_cmd = v_in if abs(v_in) > 1e-6 else float(self.default_speed)
         self.pub_state.publish(String(data="NORMAL"))
